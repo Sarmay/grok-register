@@ -1060,6 +1060,108 @@ def mailnest_get_code(email, timeout=60, poll_interval=3, log_callback=None, can
     )
 
 
+_MAILNEST_NO_REUSE = {
+    FAIL_ALREADY_REGISTERED,
+    FAIL_RISK,
+    FAIL_DOMAIN,
+    FAIL_INVALID_CREDENTIALS,
+    FAIL_CPA,
+}
+
+
+def _using_mailnest() -> bool:
+    return get_email_provider() == "mailnest"
+
+
+def _mailnest_log(log_callback, message: str) -> None:
+    if log_callback:
+        log_callback(message)
+        return
+    registration_log(message)
+
+
+def acquire_mailnest_email(log_callback=None) -> str:
+    """优先复用已扣费且未过期的邮箱，否则新购买。"""
+    key = get_mailnest_api_key()
+    project = get_mailnest_project_code()
+    order = mailnest_provider.claim_reusable(email_registered_successfully)
+    if order is None:
+        order = mailnest_provider.buy_order(http_post, key, project)
+        mailnest_provider.track_order(order)
+        expiry = order.expired_at_text or "未知"
+        _mailnest_log(log_callback, f"[*] MailNest 购买邮箱: {order.email}，有效至 {expiry}")
+        return order.email
+    _mailnest_log(
+        log_callback,
+        f"[*] MailNest 复用已扣费邮箱: {order.email}，剩余约 {max(order.remaining_seconds(), 0)}s",
+    )
+    return order.email
+
+
+def finish_mailnest_email(email: str) -> None:
+    """注册已经拿到 SSO，这个地址不能再拿去开新号。"""
+    if not _using_mailnest():
+        return
+    mailnest_provider.drop_order(str(email or ""))
+
+
+def _mailnest_release(email: str, log_callback=None) -> str:
+    try:
+        result = mailnest_provider.release_email(http_post, get_mailnest_api_key(), email)
+    except Exception as exc:
+        mailnest_provider.drop_order(email)
+        _mailnest_log(log_callback, f"[!] MailNest 释放邮箱失败: {email}: {exc}")
+        return "discarded"
+    if result == "released":
+        mailnest_provider.drop_order(email)
+        _mailnest_log(log_callback, f"[*] MailNest 未收到验证码，已释放并退回冻结: {email}")
+        return "released"
+    if result == "charged":
+        order = mailnest_provider.get_order(email)
+        if order is not None and not order.code_received:
+            order.code_received = True
+            order.last_received_at = max(order.last_received_at, time.time())
+        if mailnest_provider.recycle_order(email):
+            _mailnest_log(log_callback, f"[*] MailNest 邮箱已扣费，改为继续复用: {email}")
+            return "reused"
+    mailnest_provider.drop_order(email)
+    if result == "charged":
+        _mailnest_log(log_callback, f"[*] MailNest 邮箱已扣费且剩余时间不足，不再复用: {email}")
+    else:
+        _mailnest_log(log_callback, f"[!] MailNest 释放邮箱未成功: {email}")
+    return "discarded"
+
+
+def settle_mailnest_email(email, exc=None, *, sso="", failure_type="", log_callback=None) -> str:
+    """失败后释放未扣费邮箱，或把已扣费邮箱放回 20 分钟复用队列。
+
+    SSO 超时且邮箱仍有余量时返回 retry_same，调用方应再试一次而不记失败。
+    """
+    if not _using_mailnest():
+        return "ignored"
+    address = str(email or mailnest_provider.active_email() or "").strip()
+    if not address:
+        return "ignored"
+    if str(sso or "").strip():
+        mailnest_provider.drop_order(address)
+        return "discarded"
+    kind = failure_type or (classify_failure(exc) if exc is not None else "")
+    if kind == FAIL_SSO and mailnest_provider.prepare_sso_timeout_retry(address):
+        _mailnest_log(log_callback, f"[!] SSO 超时，同一 MailNest 邮箱再试一次: {address}")
+        return "retry_same"
+    if kind in _MAILNEST_NO_REUSE or kind == FAIL_SSO:
+        mailnest_provider.drop_order(address)
+        _mailnest_log(log_callback, f"[*] MailNest 邮箱不再复用: {address}")
+        return "discarded"
+    if mailnest_provider.code_was_received(address):
+        if mailnest_provider.recycle_order(address, reason=kind):
+            _mailnest_log(log_callback, f"[*] MailNest 验证码已扣费，下一轮继续使用: {address}")
+            return "reused"
+        _mailnest_log(log_callback, f"[*] MailNest 邮箱剩余时间不足，不再复用: {address}")
+        return "discarded"
+    return _mailnest_release(address, log_callback)
+
+
 def get_outlookemail_api_base():
     return str(config.get("outlookemail_api_base", "") or "").strip().rstrip("/")
 
@@ -2371,7 +2473,7 @@ def get_email_and_token(api_key=None):
                     f"{fallback_exc.__class__.__name__}: {fallback_exc}"
                 ) from fallback_exc
     if provider == "mailnest":
-        return mailnest_buy_email(), "_"
+        return acquire_mailnest_email(), "_"
     return duckmail_provider.create_mailbox(
         http_get,
         http_post,
@@ -3267,6 +3369,7 @@ def run_registration(count):
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             result_out=cpa_detail,
                         )
+                        finish_mailnest_email(email)
                         if config.get("enable_nsfw", True):
                             nsfw_ok, nsfw_msg = enable_nsfw_for_token(
                                 sso,
@@ -3363,7 +3466,12 @@ def run_registration(count):
                                 extra={"任务序号": i, "并发数": workers},
                             )
                     except RegistrationCancelled:
-                        cancelled_email = current_attempt_email(email)
+                        cancelled_email = current_attempt_email(email) or mailnest_provider.active_email()
+                        settle_mailnest_email(
+                            cancelled_email,
+                            sso=sso,
+                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                        )
                         if cancelled_email:
                             _persist_result(
                                 started_at=attempt_started_at,
@@ -3380,6 +3488,13 @@ def run_registration(count):
                         break
                     except EmailDomainRejected as exc:
                         kind = classify_failure(exc)
+                        fail_email = current_attempt_email(email, exc) or mailnest_provider.active_email()
+                        settle_mailnest_email(
+                            fail_email,
+                            exc,
+                            failure_type=kind,
+                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                        )
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
                         i += 1
@@ -3387,7 +3502,7 @@ def run_registration(count):
                         _persist_result(
                             started_at=attempt_started_at,
                             worker_id=wid,
-                            email=current_attempt_email(email, exc),
+                            email=fail_email,
                             password=current_attempt_password(profile),
                             status="failure",
                             cpa_detail=cpa_detail,
@@ -3397,6 +3512,12 @@ def run_registration(count):
                         )
                         registration_log(f"[W{wid+1}] [-] 域名拒绝: {exc}")
                     except AccountRetryNeeded as exc:
+                        settle_mailnest_email(
+                            current_attempt_email(email, exc) or mailnest_provider.active_email(),
+                            exc,
+                            failure_type=FAIL_STUCK,
+                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                        )
                         retry += 1
                         if retry > account_retry_limit(exc, max_slot_retry):
                             retry_used = retry
@@ -3423,6 +3544,14 @@ def run_registration(count):
                         elif getattr(exc, "single_retry", False):
                             registration_log(f"[W{wid+1}] [!] {exc}")
                     except Exception as exc:
+                        fail_email = current_attempt_email(email, exc) or mailnest_provider.active_email()
+                        if settle_mailnest_email(
+                            fail_email,
+                            exc,
+                            sso=sso,
+                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                        ) == "retry_same":
+                            continue
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
@@ -3435,7 +3564,6 @@ def run_registration(count):
                                 email=current_attempt_email(email, exc),
                                 log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             )
-                        fail_email = current_attempt_email(email, exc)
                         email_disable_detail = maybe_disable_outlookemail_for_consumed_failure(
                             kind,
                             fail_email,
@@ -3574,6 +3702,7 @@ def run_registration(count):
                     except Exception as mail_exc:
                         msg = str(mail_exc)
                         if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                            settle_mailnest_email(email, mail_exc, log_callback=registration_log)
                             _persist_result(
                                 started_at=mail_attempt_started_at,
                                 email=email,
@@ -3607,6 +3736,7 @@ def run_registration(count):
                     log_callback=registration_log,
                     result_out=cpa_detail,
                 )
+                finish_mailnest_email(email)
                 if config.get("enable_nsfw", True):
                     registration_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -3706,7 +3836,8 @@ def run_registration(count):
                         reason=f"已成功 {success_count} 个账号，执行定期清理",
                     )
             except RegistrationCancelled:
-                cancelled_email = current_attempt_email(email)
+                cancelled_email = current_attempt_email(email) or mailnest_provider.active_email()
+                settle_mailnest_email(cancelled_email, sso=sso, log_callback=registration_log)
                 if cancelled_email:
                     _persist_result(
                         started_at=attempt_started_at,
@@ -3723,11 +3854,18 @@ def run_registration(count):
                 break
             except EmailDomainRejected as exc:
                 kind = _record_failure(exc)
+                fail_email = current_attempt_email(email, exc) or mailnest_provider.active_email()
+                settle_mailnest_email(
+                    fail_email,
+                    exc,
+                    failure_type=kind,
+                    log_callback=registration_log,
+                )
                 retry_count_for_slot = 0
                 i += 1
                 _persist_result(
                     started_at=attempt_started_at,
-                    email=current_attempt_email(email, exc),
+                    email=fail_email,
                     password=current_attempt_password(profile),
                     status="failure",
                     cpa_detail=cpa_detail,
@@ -3738,6 +3876,12 @@ def run_registration(count):
                 registration_log(f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                 registration_log("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
             except AccountRetryNeeded as exc:
+                settle_mailnest_email(
+                    current_attempt_email(email, exc) or mailnest_provider.active_email(),
+                    exc,
+                    failure_type=FAIL_STUCK,
+                    log_callback=registration_log,
+                )
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= account_retry_limit(exc, max_slot_retry):
                     if getattr(exc, "single_retry", False):
@@ -3766,6 +3910,9 @@ def run_registration(count):
                     )
                     registration_log(f"[-] 当前账号已达到最大重试次数，跳过 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
             except Exception as exc:
+                fail_email = current_attempt_email(email, exc) or mailnest_provider.active_email()
+                if settle_mailnest_email(fail_email, exc, sso=sso, log_callback=registration_log) == "retry_same":
+                    continue
                 kind = _record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
@@ -3773,10 +3920,9 @@ def run_registration(count):
                     mark_registration_risk(
                         cpa_detail,
                         exc,
-                        email=current_attempt_email(email, exc),
+                        email=fail_email,
                         log_callback=registration_log,
                     )
-                fail_email = current_attempt_email(email, exc)
                 email_disable_detail = maybe_disable_outlookemail_for_consumed_failure(
                     kind,
                     fail_email,
