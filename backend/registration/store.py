@@ -402,7 +402,8 @@ class RegistrationRepository:
                 conn.execute(
                     """
                     UPDATE grokiq_outbox
-                    SET sso = ?, status = 'pending', next_attempt_at = ?, updated_at = ?
+                    SET sso = ?, status = 'pending', attempts = 0, last_error = '',
+                        next_attempt_at = ?, updated_at = ?
                     WHERE event_id = ? AND sso != ?
                     """,
                     (normalized_sso, now_epoch, now_text, event_id, normalized_sso),
@@ -485,6 +486,23 @@ class RegistrationRepository:
                     next_attempt,
                     str(error or "")[:4000],
                     str(response_json or "")[:16000],
+                    now_text,
+                    str(event_id),
+                ),
+            )
+
+    def abandon_grokiq_delivery(self, event_id: str, *, error: str) -> None:
+        """停止继续投递。新的 SSO 重新入队时会把次数清零。"""
+        now_text = self.now_text()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE grokiq_outbox
+                SET status = 'dead', last_error = ?, updated_at = ?
+                WHERE event_id = ? AND status != 'delivered'
+                """,
+                (
+                    str(error or "")[:4000],
                     now_text,
                     str(event_id),
                 ),

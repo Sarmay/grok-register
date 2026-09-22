@@ -356,8 +356,11 @@ class CamoufoxPage:
     def forward(self):
         self._page.go_forward()
 
-    def reload(self):
-        self._page.reload()
+    def reload(self, **kw):
+        # 与 get() 一样只等 DOM。完整 load 会被慢代理和第三方资源拖住。
+        kw.setdefault("wait_until", "domcontentloaded")
+        kw.setdefault("timeout", 45_000)
+        self._page.reload(**kw)
 
     # ── 属性 ──
     @property

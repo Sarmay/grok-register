@@ -549,6 +549,13 @@ FAIL_LABELS = {
 }
 
 
+def account_retry_limit(exc, max_slot_retry: int) -> int:
+    """Turnstile 换出口只重试一次；其它卡住流程沿用槽位重试上限。"""
+    if getattr(exc, "single_retry", False):
+        return 1
+    return max(int(max_slot_retry or 0), 0)
+
+
 def classify_failure(exc) -> str:
     from backend.registration.login_flow import (
         InvalidLoginCredentials,
@@ -2678,6 +2685,52 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 
+def _page_host(page_obj) -> str:
+    url = str(getattr(page_obj, "url", "") or "")
+    return (urlsplit(url).hostname or "").lower()
+
+
+def _open_grok_for_nsfw(page_obj, log_callback=None) -> None:
+    """等当前跳转结束再打开 grok.com。已在 grok.com 时不再导航。
+
+    注册刚拿到 SSO 时，accounts.x.ai 的跳转往往还没结束。立刻再 goto
+    会在 Camoufox 上撞成 NS_BINDING_ABORTED。
+    """
+    def _wait_for_document():
+        waiter = getattr(page_obj, "wait", None)
+        if waiter is None or not hasattr(waiter, "doc_loaded"):
+            return
+        try:
+            waiter.doc_loaded(timeout=8)
+        except Exception:
+            pass
+
+    def _already_on_grok() -> bool:
+        host = _page_host(page_obj)
+        return host == "grok.com" or host.endswith(".grok.com")
+
+    _wait_for_document()
+    if _already_on_grok():
+        if log_callback:
+            log_callback("[*] 浏览器已在 grok.com，跳过重复打开")
+        return
+    for attempt in (1, 2):
+        try:
+            page_obj.get("https://grok.com/")
+            return
+        except Exception as exc:
+            if "NS_BINDING_ABORTED" not in str(exc) or attempt == 2:
+                raise
+            if log_callback:
+                log_callback("[!] 打开 grok.com 与当前跳转冲突，1 秒后重试")
+            time.sleep(1)
+            _wait_for_document()
+            if _already_on_grok():
+                if log_callback:
+                    log_callback("[*] 冲突后的跳转已到达 grok.com")
+                return
+
+
 def enable_nsfw_via_browser(token="", log_callback=None):
     """在已登录的注册浏览器内调用 grok.com 接口，绕过外部 HTTP 的 CF 拦截。"""
     page_obj = _active_page()
@@ -2714,7 +2767,7 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
                     )
                 except Exception:
                     pass
-        page_obj.get("https://grok.com/")
+        _open_grok_for_nsfw(page_obj, log_callback=log_callback)
         try:
             page_obj.wait.doc_loaded()
         except Exception:
@@ -3049,8 +3102,29 @@ def run_registration(count):
         startup_checks = _conn.run_connectivity_checks(config, http_get, http_post)
         for name, ok, detail in startup_checks:
             registration_log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
+
+        def _retry_xai_signup_check():
+            time.sleep(1)
+            return _conn.check_xai_signup(
+                resolve_proxy_url(config.get("proxy", "")),
+                http_get,
+            )
+
+        startup_checks = _conn.retry_timeout_xai_check(
+            startup_checks,
+            _retry_xai_signup_check,
+            registration_log,
+        )
         if _conn.has_blocking_xai_failure(startup_checks):
-            registration_log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试")
+            detail = next(
+                (
+                    item_detail
+                    for item_name, item_ok, item_detail in startup_checks
+                    if item_name == _conn.XAI_SIGNUP_CHECK_NAME and not item_ok
+                ),
+                "",
+            )
+            registration_log(_conn.startup_block_message(detail))
             return
     except Exception as exc:
         registration_log(f"[!] 启动连通性检查异常，继续注册: {exc}")
@@ -3324,7 +3398,7 @@ def run_registration(count):
                         registration_log(f"[W{wid+1}] [-] 域名拒绝: {exc}")
                     except AccountRetryNeeded as exc:
                         retry += 1
-                        if retry > max_slot_retry:
+                        if retry > account_retry_limit(exc, max_slot_retry):
                             retry_used = retry
                             kind = classify_failure(exc)
                             local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
@@ -3346,6 +3420,8 @@ def run_registration(count):
                                 extra={"重试次数": retry_used},
                             )
                             registration_log(f"[W{wid+1}] [-] 卡住跳过: {exc}")
+                        elif getattr(exc, "single_retry", False):
+                            registration_log(f"[W{wid+1}] [!] {exc}")
                     except Exception as exc:
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
@@ -3663,10 +3739,13 @@ def run_registration(count):
                 registration_log("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
             except AccountRetryNeeded as exc:
                 retry_count_for_slot += 1
-                if retry_count_for_slot <= max_slot_retry:
-                    registration_log(
-                        f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
-                    )
+                if retry_count_for_slot <= account_retry_limit(exc, max_slot_retry):
+                    if getattr(exc, "single_retry", False):
+                        registration_log(f"[!] {exc}")
+                    else:
+                        registration_log(
+                            f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
+                        )
                 else:
                     retry_used = retry_count_for_slot
                     kind = _record_failure(exc)

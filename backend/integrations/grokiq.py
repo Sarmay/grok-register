@@ -18,6 +18,9 @@ from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
+# 失败后退避最高约 300 秒，但次数必须封顶，否则一条坏 webhook 会一直刷日志。
+GROKIQ_MAX_DELIVERY_ATTEMPTS = 8
+
 
 class GrokIQDeliveryError(RuntimeError):
     def __init__(self, message: str, *, response_text: str = ""):
@@ -214,6 +217,18 @@ class GrokIQNotifier:
                 if isinstance(exc, GrokIQDeliveryError)
                 else response_text
             )
+            if attempts >= GROKIQ_MAX_DELIVERY_ATTEMPTS:
+                self._repository.abandon_grokiq_delivery(
+                    event_id,
+                    error=str(exc),
+                )
+                logger.warning(
+                    "GrokIQ webhook dead-letter event_id=%s attempts=%s error=%s",
+                    event_id,
+                    attempts,
+                    exc,
+                )
+                return
             self._repository.retry_grokiq_delivery(
                 event_id,
                 error=str(exc),

@@ -20,6 +20,7 @@ from backend.automation.session import (
     traffic_savings_level,
 )
 from backend.registration.signup_flow import (
+    TurnstileWidgetRejected,
     _dismiss_cookie_consent,
     _native_click_action,
     _native_input_candidates,
@@ -594,11 +595,15 @@ def _prepare_login_turnstile(log_callback=None) -> None:
                 if log_callback:
                     log_callback("[*] 登录页未出现 Turnstile，继续提交登录")
                 return
-    if not _try_sync_turnstile(
-        log_callback=log_callback,
-        cancel_callback=None,
-        reason="等待登录安全验证",
-    ):
+    try:
+        synced = _try_sync_turnstile(
+            log_callback=log_callback,
+            cancel_callback=None,
+            reason="等待登录安全验证",
+        )
+    except TurnstileWidgetRejected:
+        synced = False
+    if not synced:
         raise RuntimeError("登录安全验证未通过")
 
 
@@ -617,11 +622,15 @@ def _recover_login_turnstile(log_callback=None, *, full_sync: bool = False) -> N
         return
     if log_callback:
         log_callback("[*] 登录后仍停在登录页，补做安全验证后重试提交")
-    if not _try_sync_turnstile(
-        log_callback=log_callback,
-        cancel_callback=None,
-        reason="登录后补做安全验证",
-    ):
+    try:
+        synced = _try_sync_turnstile(
+            log_callback=log_callback,
+            cancel_callback=None,
+            reason="登录后补做安全验证",
+        )
+    except TurnstileWidgetRejected:
+        synced = False
+    if not synced:
         if log_callback:
             log_callback("[Debug] 登录后安全验证仍未通过，继续等待并重试点击")
         return

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import socket
 import time
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from backend.mailbox import cloudflare_worker as cloudflare_provider
@@ -138,11 +138,92 @@ def check_xai_signup(proxy_url: str, http_get: Callable) -> CheckResult:
             return XAI_SIGNUP_CHECK_NAME, False, f"HTTP {status or 'unknown'}"
         return XAI_SIGNUP_CHECK_NAME, True, f"可达 HTTP {status}"
     except Exception as exc:
-        return XAI_SIGNUP_CHECK_NAME, False, redact_proxy_text(exc)
+        return XAI_SIGNUP_CHECK_NAME, False, _xai_transport_detail(exc)
+
+
+def _xai_transport_detail(exc: BaseException) -> str:
+    """把注册页探测异常分成超时和代理隧道故障，避免都写成 Cloudflare 拦截。"""
+    text = redact_proxy_text(exc)
+    low = text.lower()
+    if (
+        "curl: (28)" in low
+        or "timed out" in low
+        or "timeout" in low
+    ):
+        return f"注册页连接超时: {text}"
+    if (
+        "wrong_version_number" in low
+        or "connect tunnel failed" in low
+        or "response 502" in low
+        or "response 503" in low
+        or "curl: (35)" in low
+        or "curl: (56)" in low
+        or "ssl_error" in low
+        or "invalid library" in low
+    ):
+        return f"代理隧道异常: {text}"
+    return text
+
+
+def xai_failure_kind(detail: str) -> str:
+    """cloudflare / proxy / timeout / other。超时不应直接停掉整轮建号。"""
+    text = str(detail or "")
+    if "Cloudflare 拦截" in text or "仍停留在 Cloudflare" in text:
+        return "cloudflare"
+    if text.startswith("代理隧道异常"):
+        return "proxy"
+    if text.startswith("注册页连接超时"):
+        return "timeout"
+    return "other"
 
 
 def has_blocking_xai_failure(results: List[CheckResult]) -> bool:
-    return any(name == XAI_SIGNUP_CHECK_NAME and not ok for name, ok, _ in results)
+    """真挑战页、代理隧道故障和其他 HTTP 失败会阻止建号。连接超时留给重试。"""
+    for name, ok, detail in results:
+        if name != XAI_SIGNUP_CHECK_NAME or ok:
+            continue
+        if xai_failure_kind(detail) == "timeout":
+            continue
+        return True
+    return False
+
+
+def startup_block_message(detail: str) -> str:
+    kind = xai_failure_kind(detail)
+    if kind == "cloudflare":
+        return "[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试"
+    if kind == "proxy":
+        return "[!] 代理隧道异常，已停止建号；请重启或更换当前 proxy 后重试"
+    return f"[!] xAI 注册页预检失败，已停止建号: {detail}"
+
+
+def retry_timeout_xai_check(
+    results: List[CheckResult],
+    retry_check: Callable[[], CheckResult],
+    log: Optional[Callable[[str], None]] = None,
+) -> List[CheckResult]:
+    """注册页超时时再探一次。第二次仍超时则保留失败结果，由调用方继续建号。"""
+    updated = list(results)
+    for index, (name, ok, detail) in enumerate(updated):
+        if name != XAI_SIGNUP_CHECK_NAME or ok:
+            continue
+        if xai_failure_kind(detail) != "timeout":
+            return updated
+        if log:
+            log("[!] xAI 注册页预检超时，重试一次")
+        retried = retry_check()
+        if log:
+            retry_name, retry_ok, retry_detail = retried
+            log(f"[检查] [{'OK' if retry_ok else 'FAIL'}] {retry_name}: {retry_detail}")
+        updated[index] = retried
+        if (
+            log
+            and not retried[1]
+            and xai_failure_kind(retried[2]) == "timeout"
+        ):
+            log("[!] xAI 注册页预检仍然超时，继续建号")
+        return updated
+    return updated
 
 
 def check_email_api(provider: str, config: dict, http_get: Callable, http_post: Callable) -> CheckResult:

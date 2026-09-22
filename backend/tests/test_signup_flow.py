@@ -28,6 +28,80 @@ class SignupFlowTests(unittest.TestCase):
         element = self.NativeInput(current_value="Neo")
         self.assertTrue(signup_flow._native_type_element(element, "Neo"))
 
+    def test_turnstile_problem_detects_verification_failed_text(self):
+        page = mock.Mock()
+        page.run_js.return_value = "failed"
+        with mock.patch.object(signup_flow, "page", page):
+            self.assertEqual(signup_flow._turnstile_widget_problem(), "failed")
+
+    def test_turnstile_click_stops_when_widget_already_failed(self):
+        page = mock.Mock()
+
+        def run_js(script, *args):
+            if "verification failed" in script:
+                return "failed"
+            return ""
+
+        page.run_js.side_effect = run_js
+        logs = []
+        signup_flow.configure(sleep_with_cancel=lambda *args, **kwargs: None)
+        with mock.patch.object(signup_flow, "page", page), mock.patch.object(
+            signup_flow, "active_page", return_value=page
+        ), mock.patch.object(
+            signup_flow, "_try_click_turnstile_frame"
+        ) as click:
+            with self.assertRaises(signup_flow.TurnstileWidgetRejected):
+                signup_flow.getTurnstileToken(log_callback=logs.append, max_unsolved_clicks=2)
+        click.assert_not_called()
+
+    def test_rejected_turnstile_refreshes_once_then_requests_new_exit(self):
+        page = mock.Mock()
+        signup_flow.configure(
+            AccountRetryNeeded=engine.AccountRetryNeeded,
+            sleep_with_cancel=lambda *args, **kwargs: None,
+        )
+        with mock.patch.object(signup_flow, "page", page):
+            refreshed = signup_flow._reject_turnstile_or_refresh(
+                False,
+                signup_flow.TurnstileWidgetRejected("Verification failed"),
+            )
+            self.assertTrue(refreshed)
+            page.reload.assert_called_once_with()
+            with self.assertRaises(engine.AccountRetryNeeded) as caught:
+                signup_flow._reject_turnstile_or_refresh(
+                    True,
+                    signup_flow.TurnstileWidgetRejected("Verification failed"),
+                )
+        self.assertTrue(caught.exception.single_retry)
+
+    def test_turnstile_exit_retry_is_limited_to_one(self):
+        exc = engine.AccountRetryNeeded("Turnstile 刷新后仍失败")
+        exc.single_retry = True
+        self.assertEqual(engine.account_retry_limit(exc, 3), 1)
+        self.assertEqual(engine.account_retry_limit(engine.AccountRetryNeeded("卡住"), 3), 3)
+
+    def test_nsfw_navigation_waits_and_retries_binding_abort(self):
+        page = mock.Mock()
+        page.url = "https://accounts.x.ai/sign-up?redirect=grok-com"
+        page.wait = mock.Mock()
+        page.get.side_effect = [
+            Exception("Page.goto: NS_BINDING_ABORTED; maybe frame was detached?"),
+            None,
+        ]
+        logs = []
+        with mock.patch.object(engine.time, "sleep"):
+            engine._open_grok_for_nsfw(page, log_callback=logs.append)
+        self.assertEqual(page.wait.doc_loaded.call_count, 2)
+        page.wait.doc_loaded.assert_called_with(timeout=8)
+        self.assertEqual(page.get.call_count, 2)
+        self.assertTrue(any("1 秒后重试" in line for line in logs))
+
+    def test_nsfw_navigation_skips_goto_when_already_on_grok(self):
+        page = mock.Mock()
+        page.url = "https://grok.com/"
+        engine._open_grok_for_nsfw(page)
+        page.get.assert_not_called()
+
     def test_detects_account_already_registered_notice(self):
         page = mock.Mock()
         page.run_js.return_value = {

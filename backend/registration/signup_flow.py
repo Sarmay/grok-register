@@ -37,6 +37,10 @@ class AccountAlreadyRegistered(Exception):
     """资料提交后站点明确提示邮箱或账号已经存在。"""
 
 
+class TurnstileWidgetRejected(Exception):
+    """资料页 Turnstile 已失败或组件空白，继续点击不会产生 token。"""
+
+
 _ALREADY_REGISTERED_PATTERNS = (
     re.compile(r"existing account found", re.I),
     re.compile(r"email.{0,80}already.{0,40}(?:registered|exists|in use|used|taken)", re.I),
@@ -1469,10 +1473,79 @@ return String(cfInput.value || '').trim().length;
     )
 
 
+_TURNSTILE_PROBLEM_JS = r"""
+const body = String((document.body && document.body.innerText) || '')
+  .replace(/\s+/g, ' ')
+  .toLowerCase();
+if (
+  body.includes('verification failed')
+  || body.includes('please refresh the page')
+  || body.includes('验证失败')
+  || body.includes('请刷新页面')
+) return 'failed';
+const frame = document.querySelector(
+  'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+);
+const slot = document.querySelector('.cf-turnstile, [data-sitekey]');
+function size(node) {
+  if (!node) return { w: 0, h: 0 };
+  const rect = node.getBoundingClientRect();
+  return { w: rect.width, h: rect.height };
+}
+if (!frame) {
+  const slotSize = size(slot);
+  if (slot && slotSize.w > 40 && slotSize.h > 16) return 'blank';
+  return '';
+}
+const src = String(frame.getAttribute('src') || '');
+const frameSize = size(frame);
+if (!src || src === 'about:blank' || frameSize.w < 20 || frameSize.h < 16) return 'blank';
+return '';
+"""
+
+
+def _turnstile_widget_problem() -> str:
+    """返回 failed、blank，或空字符串。空白只在组件坑位已经出现时判定。"""
+    try:
+        value = page.run_js(_TURNSTILE_PROBLEM_JS)
+    except Exception:
+        return ""
+    text = str(value or "").strip()
+    if text in {"failed", "blank"}:
+        return text
+    return ""
+
+
+def _reject_turnstile_or_refresh(
+    already_refreshed: bool,
+    exc: BaseException,
+    log_callback=None,
+    cancel_callback=None,
+) -> bool:
+    """失效组件先刷新重填一次。已经刷新过则要求换浏览器出口。"""
+    if already_refreshed:
+        err = _AccountRetryNeeded("Turnstile 刷新后仍失败，重启浏览器更换出口后重试")
+        setattr(err, "single_retry", True)
+        raise err from exc
+    if log_callback:
+        log_callback(f"[*] Turnstile 组件失效（{exc}），刷新资料页后重填")
+    try:
+        page.reload()
+    except Exception as reload_exc:
+        err = _AccountRetryNeeded(
+            f"Turnstile 组件失效且刷新资料页失败，重启浏览器更换出口后重试: {reload_exc}"
+        )
+        setattr(err, "single_retry", True)
+        raise err from reload_exc
+    sleep_with_cancel(0.6, cancel_callback)
+    return True
+
+
 def _try_sync_turnstile(
     log_callback=None,
     cancel_callback=None,
     reason="自动复用 Turnstile",
+    max_unsolved_clicks=20,
 ) -> bool:
     """主动获取 Turnstile token 并回填；成功返回 True。
 
@@ -1507,13 +1580,19 @@ try {
 
     # token 为空，进入完整获取流程（被动等待优先，不 reset）
     try:
-        token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
+        token = getTurnstileToken(
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            max_unsolved_clicks=max_unsolved_clicks,
+        )
         if not token:
             return False
         synced = _fill_cf_turnstile_token(token)
         if log_callback:
             log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
         return bool(synced and int(synced or 0) >= 80)
+    except TurnstileWidgetRejected:
+        raise
     except Exception as cf_exc:
         if log_callback:
             log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
@@ -1523,7 +1602,12 @@ try {
 _turnstile_reset_done = False
 
 
-def getTurnstileToken(log_callback=None, cancel_callback=None, force_reset=False):
+def getTurnstileToken(
+    log_callback=None,
+    cancel_callback=None,
+    force_reset=False,
+    max_unsolved_clicks=20,
+):
     """获取 Turnstile token（直接点击 + 轮询等待）。
 
     Turnstile iframe 内无 checkbox DOM 元素（canvas/overlay 渲染），
@@ -1535,12 +1619,13 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, force_reset=False
     if active_page() is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
-    click_attempted = False
+    clicks = 0
     last_click_round = -100
     TOTAL_ROUNDS = 20
     POLL_INTERVAL = 2.0
+    click_limit = max(int(max_unsolved_clicks or 1), 1)
 
-    for _ in range(0, TOTAL_ROUNDS):
+    for round_index in range(0, TOTAL_ROUNDS):
         raise_if_cancelled(cancel_callback)
         try:
             token = page.run_js(
@@ -1561,24 +1646,33 @@ try {
                     log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
                 return token
 
+            problem = _turnstile_widget_problem()
+            if problem == "failed" or (problem == "blank" and clicks >= 1):
+                detail = "Verification failed" if problem == "failed" else "Turnstile 组件空白"
+                raise TurnstileWidgetRejected(detail)
+            if clicks >= click_limit:
+                raise TurnstileWidgetRejected("Turnstile 点击后仍无 token")
+
             # 直接点击（首次或间隔重试）
-            if not click_attempted or (_ - last_click_round >= 4):
-                if not click_attempted:
+            if clicks == 0 or (round_index - last_click_round >= 4):
+                if clicks == 0:
                     if log_callback:
                         log_callback("[*] 尝试点击 Turnstile...")
                 else:
                     if log_callback:
                         log_callback("[*] 再次尝试点击 Turnstile...")
                 _try_click_turnstile_frame(log_callback=log_callback)
-                click_attempted = True
-                last_click_round = _
+                clicks += 1
+                last_click_round = round_index
                 sleep_with_cancel(3.0, cancel_callback)
                 continue
+        except TurnstileWidgetRejected:
+            raise
         except Exception:
             pass
         sleep_with_cancel(POLL_INTERVAL, cancel_callback)
 
-    raise Exception("Turnstile 获取 token 失败")
+    raise TurnstileWidgetRejected("Turnstile 获取 token 失败")
 
 
 def _try_click_turnstile_frame(log_callback=None):
@@ -1713,6 +1807,36 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     last_cf_log_at = 0.0
     last_logged_token_len = None
     last_form_diag_at = 0.0
+    profile_refreshed = False
+    profile_refreshed_at = 0.0
+
+    def _refresh_rejected_turnstile(exc):
+        nonlocal profile_refreshed, profile_refreshed_at, form_filled_once, wait_cf_since
+        nonlocal last_cf_retry_at, last_logged_token_len, deadline
+        profile_refreshed = _reject_turnstile_or_refresh(
+            profile_refreshed,
+            exc,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+        form_filled_once = False
+        wait_cf_since = None
+        last_cf_retry_at = 0.0
+        last_logged_token_len = None
+        profile_refreshed_at = time.time()
+        deadline = max(deadline, time.time() + 45)
+
+    def _turnstile_needs_refresh(now):
+        if profile_refreshed and now - profile_refreshed_at < 2.0:
+            return False
+        problem = _turnstile_widget_problem()
+        if problem == "failed":
+            return True
+        return bool(
+            problem == "blank"
+            and wait_cf_since is not None
+            and (now - wait_cf_since) >= CF_FIRST_RETRY_AFTER
+        )
 
     def _maybe_log_cf_wait(message, token_len):
         nonlocal last_cf_log_at, last_logged_token_len
@@ -1829,12 +1953,20 @@ return 'filled-no-submit';
                     wait_cf_since = now
                     # 首次仅短停，尽快进入主动复用节奏（原 1–3s 随机空等已去掉）
                     sleep_with_cancel(0.4, cancel_callback)
+                if _turnstile_needs_refresh(now):
+                    _refresh_rejected_turnstile(TurnstileWidgetRejected("资料页 Turnstile 失效"))
+                    continue
                 if _should_retry_cf(wait_cf_since, last_cf_retry_at, now):
-                    synced = _try_sync_turnstile(
-                        log_callback=log_callback,
-                        cancel_callback=cancel_callback,
-                        reason="Cloudflare 验证卡住，开始二次复用 Turnstile",
-                    )
+                    try:
+                        synced = _try_sync_turnstile(
+                            log_callback=log_callback,
+                            cancel_callback=cancel_callback,
+                            reason="Cloudflare 验证卡住，开始二次复用 Turnstile",
+                            max_unsolved_clicks=2,
+                        )
+                    except TurnstileWidgetRejected as exc:
+                        _refresh_rejected_turnstile(exc)
+                        continue
                     last_cf_retry_at = time.time()
                     if synced:
                         # Turnstile 已通过并回填，跳过下一轮 CF 检查直接提交
@@ -1931,12 +2063,20 @@ return 'ready-to-submit';
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now
+            if _turnstile_needs_refresh(now):
+                _refresh_rejected_turnstile(TurnstileWidgetRejected("资料页 Turnstile 失效"))
+                continue
             if _should_retry_cf(wait_cf_since, last_cf_retry_at, now):
-                synced = _try_sync_turnstile(
-                    log_callback=log_callback,
-                    cancel_callback=cancel_callback,
-                    reason="提交前仍卡住，自动再次复用 Turnstile",
-                )
+                try:
+                    synced = _try_sync_turnstile(
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                        reason="提交前仍卡住，自动再次复用 Turnstile",
+                        max_unsolved_clicks=2,
+                    )
+                except TurnstileWidgetRejected as exc:
+                    _refresh_rejected_turnstile(exc)
+                    continue
                 last_cf_retry_at = time.time()
                 if synced:
                     # Turnstile 已通过并回填，跳过下一轮 CF 检查直接提交
@@ -1988,6 +2128,10 @@ btn.focus(); btn.click(); return 'submitted';
 
         sleep_with_cancel(0.5, cancel_callback)
 
+    if profile_refreshed:
+        err = _AccountRetryNeeded("Turnstile 刷新后资料页仍未提交，重启浏览器更换出口后重试")
+        setattr(err, "single_retry", True)
+        raise err
     raise Exception("最终注册页资料填写失败")
 
 

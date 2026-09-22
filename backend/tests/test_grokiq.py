@@ -106,6 +106,64 @@ class GrokIQOutboxTests(unittest.TestCase):
         self.assertIn("HTTP 503", delivery["last_error"])
         self.assertGreater(delivery["next_attempt_at"], time.time())
 
+    def test_webhook_is_dead_lettered_after_attempt_cap(self):
+        from backend.integrations.grokiq import GROKIQ_MAX_DELIVERY_ATTEMPTS
+
+        event = self.store.enqueue_grokiq_event(
+            registration_id=self.registration_id,
+            email="grokiq@example.com",
+            bot_risk=False,
+            bfs="",
+            occurred_at="2026-08-11T12:00:00Z",
+        )
+        claimed = self.store.claim_grokiq_delivery()
+        claimed["attempts"] = GROKIQ_MAX_DELIVERY_ATTEMPTS
+        notifier = GrokIQNotifier()
+        notifier._repository = self.store
+        session = FakeSession(FakeResponse(status_code=503, text="unavailable"))
+
+        with mock.patch(
+            "backend.integrations.grokiq.requests.Session",
+            return_value=session,
+        ):
+            notifier._deliver(
+                claimed,
+                {
+                    "url": "http://grokiq.test/account-imported",
+                    "token": "shared-token",
+                    "timeout": 10,
+                },
+            )
+
+        delivery = self.store.grokiq_deliveries([self.registration_id])[self.registration_id]
+        self.assertEqual(delivery["event_id"], event["event_id"])
+        self.assertEqual(delivery["status"], "dead")
+        self.assertIn("HTTP 503", delivery["last_error"])
+        self.assertIsNone(self.store.claim_grokiq_delivery())
+
+    def test_new_sso_requeues_a_dead_webhook(self):
+        event = self.store.enqueue_grokiq_event(
+            registration_id=self.registration_id,
+            email="grokiq@example.com",
+            bot_risk=False,
+            bfs="",
+            occurred_at="2026-08-11T12:00:00Z",
+            sso="OLD-SSO",
+        )
+        self.store.claim_grokiq_delivery()
+        self.store.abandon_grokiq_delivery(event["event_id"], error="curl: (52)")
+        refreshed = self.store.enqueue_grokiq_event(
+            registration_id=self.registration_id,
+            email="grokiq@example.com",
+            bot_risk=False,
+            bfs="",
+            occurred_at="2026-08-11T12:05:00Z",
+            sso="NEW-SSO",
+        )
+        self.assertEqual(refreshed["status"], "pending")
+        self.assertEqual(refreshed["attempts"], 0)
+        self.assertEqual(refreshed["sso"], "NEW-SSO")
+
     def test_successful_webhook_marks_claimed_event_delivered(self):
         event = self.store.enqueue_grokiq_event(
             registration_id=self.registration_id,

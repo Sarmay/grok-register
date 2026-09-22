@@ -217,6 +217,77 @@ class ProxyRoutingTests(unittest.TestCase):
                     timeout=15,
                 )
 
+    def test_xai_timeout_is_retried_and_does_not_block_startup(self):
+        timeout = (
+            network_checks.XAI_SIGNUP_CHECK_NAME,
+            False,
+            "注册页连接超时: curl: (28) Connection timed out",
+        )
+        logs = []
+        retried = (
+            network_checks.XAI_SIGNUP_CHECK_NAME,
+            True,
+            "可达 HTTP 200",
+        )
+        updated = network_checks.retry_timeout_xai_check(
+            [timeout],
+            lambda: retried,
+            logs.append,
+        )
+        self.assertEqual(updated, [retried])
+        self.assertFalse(network_checks.has_blocking_xai_failure(updated))
+        self.assertIn("重试一次", logs[0])
+
+    def test_xai_timeout_second_failure_continues_without_cloudflare_label(self):
+        timeout = (
+            network_checks.XAI_SIGNUP_CHECK_NAME,
+            False,
+            "注册页连接超时: curl: (28) Connection timed out",
+        )
+        logs = []
+        updated = network_checks.retry_timeout_xai_check(
+            [timeout],
+            lambda: timeout,
+            logs.append,
+        )
+        self.assertFalse(network_checks.has_blocking_xai_failure(updated))
+        self.assertTrue(any("继续建号" in line for line in logs))
+        self.assertNotIn("Cloudflare", network_checks.startup_block_message(timeout[2]))
+
+    def test_xai_cloudflare_and_proxy_tunnel_still_block_startup(self):
+        cloudflare = (
+            network_checks.XAI_SIGNUP_CHECK_NAME,
+            False,
+            "Cloudflare 拦截 HTTP 403；请更换当前 proxy 后重试",
+        )
+        proxy = (
+            network_checks.XAI_SIGNUP_CHECK_NAME,
+            False,
+            "代理隧道异常: curl: (35) WRONG_VERSION_NUMBER",
+        )
+        self.assertTrue(network_checks.has_blocking_xai_failure([cloudflare]))
+        self.assertTrue(network_checks.has_blocking_xai_failure([proxy]))
+        self.assertIn("Cloudflare", network_checks.startup_block_message(cloudflare[2]))
+        self.assertIn("重启或更换", network_checks.startup_block_message(proxy[2]))
+        logs = []
+        self.assertEqual(
+            network_checks.retry_timeout_xai_check([cloudflare], lambda: proxy, logs.append),
+            [cloudflare],
+        )
+        self.assertEqual(logs, [])
+
+    def test_xai_signup_timeout_exception_is_not_labeled_as_cloudflare(self):
+        class TimeoutErrorStub(Exception):
+            pass
+
+        _, ok, detail = network_checks.check_xai_signup(
+            "http://127.0.0.1:7897",
+            mock.Mock(side_effect=TimeoutErrorStub("curl: (28) Connection timed out after 15007 milliseconds")),
+        )
+        self.assertFalse(ok)
+        self.assertEqual(network_checks.xai_failure_kind(detail), "timeout")
+        self.assertNotIn("Cloudflare 拦截", detail)
+
     def test_xai_connectivity_check_explicitly_uses_configured_proxy(self):
         response = mock.Mock(status_code=200, text="<!doctype html>", headers={})
         http_get = mock.Mock(return_value=response)
