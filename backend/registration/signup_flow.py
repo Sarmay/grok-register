@@ -41,6 +41,14 @@ class TurnstileWidgetRejected(Exception):
     """资料页 Turnstile 已失败或组件空白，继续点击不会产生 token。"""
 
 
+_CODE_RATE_LIMIT_PATTERNS = (
+    re.compile(r"too many code requests", re.I),
+    re.compile(r"before requesting another code", re.I),
+    re.compile(r"验证码请求过多"),
+    re.compile(r"请稍后再.{0,24}(?:验证码|请求)"),
+    re.compile(r"已多次收取验证码"),
+)
+
 _ALREADY_REGISTERED_PATTERNS = (
     re.compile(r"existing account found", re.I),
     re.compile(r"email.{0,80}already.{0,40}(?:registered|exists|in use|used|taken)", re.I),
@@ -758,6 +766,157 @@ def raise_if_email_domain_rejected(email=""):
         raise _deps['EmailDomainRejected'](email=email, message=message)
 
 
+def looks_like_email_code_rate_limit(text="") -> str:
+    """从页面文案里抽出验证码频率限制。没有则返回空字符串。"""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return ""
+    for pattern in _CODE_RATE_LIMIT_PATTERNS:
+        match = pattern.search(raw)
+        if not match:
+            continue
+        start = max(0, match.start() - 24)
+        end = min(len(raw), match.end() + 120)
+        return raw[start:end].strip()
+    return ""
+
+
+_VISIBLE_PAGE_TEXT_JS = r"""
+const chunks = [];
+const selectors = [
+    '[role="alert"]',
+    '[data-testid*="error" i]',
+    '[class*="error" i]',
+    '[class*="Error"]',
+    '[class*="danger" i]',
+    '[class*="invalid" i]',
+    'p', 'span', 'div', 'li', 'label',
+];
+for (const sel of selectors) {
+    for (const node of Array.from(document.querySelectorAll(sel)).slice(0, 80)) {
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text && text.length >= 8 && text.length <= 400) chunks.push(text);
+    }
+}
+const body = (document.body && (document.body.innerText || document.body.textContent) || '')
+    .replace(/\s+/g, ' ').trim();
+if (body) chunks.push(body.slice(0, 1200));
+return Array.from(new Set(chunks)).join('\n');
+"""
+
+
+def _visible_page_text() -> str:
+    if not page:
+        return ""
+    try:
+        result = page.run_js(_VISIBLE_PAGE_TEXT_JS)
+    except Exception:
+        return ""
+    return result.strip() if isinstance(result, str) else ""
+
+
+def detect_email_code_rate_limit():
+    """检测 xAI 是否拒绝继续向当前邮箱发验证码。"""
+    return looks_like_email_code_rate_limit(_visible_page_text())
+
+
+def raise_if_email_code_rate_limited(email=""):
+    message = detect_email_code_rate_limit()
+    if not message:
+        return
+    cls = _deps.get("EmailCodeRateLimited")
+    if cls is None:
+        detail = f"{message} | 邮箱: {email}" if email and email not in message else message
+        raise Exception(detail)
+    raise cls(email=email, message=message)
+
+
+_EMAIL_FORM_DIAG_JS = r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function textOf(node) {
+    return [
+        node.innerText,
+        node.textContent,
+        node.getAttribute('aria-label'),
+        node.getAttribute('placeholder'),
+        node.getAttribute('name'),
+        node.getAttribute('id'),
+        node.getAttribute('type'),
+    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+const inputs = Array.from(document.querySelectorAll('input, textarea'))
+    .filter((node) => isVisible(node))
+    .map((node) => {
+        const disabled = node.disabled || node.readOnly ? ' disabled' : '';
+        return (textOf(node).slice(0, 120) + disabled).trim();
+    })
+    .slice(0, 8);
+const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+    .filter((node) => isVisible(node))
+    .map((node) => {
+        const disabled = node.disabled || node.getAttribute('aria-disabled') === 'true' ? ' disabled' : '';
+        return (textOf(node).slice(0, 80) + disabled).trim();
+    })
+    .filter(Boolean)
+    .slice(0, 8);
+const noticeNode = Array.from(document.querySelectorAll('[role="alert"], [class*="error" i], [class*="Error"], p'))
+    .find((node) => {
+        if (!isVisible(node)) return false;
+        const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        return text.length >= 8 && text.length <= 240;
+    });
+const notice = noticeNode
+    ? (noticeNode.innerText || noticeNode.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 180)
+    : '';
+const body = (document.body && (document.body.innerText || document.body.textContent) || '')
+    .replace(/\s+/g, ' ').trim().slice(0, 800);
+return { url: location.href, inputs, buttons, notice, body };
+"""
+
+
+def _email_form_diagnostic() -> dict:
+    if not page:
+        return {}
+    try:
+        result = page.run_js(_EMAIL_FORM_DIAG_JS)
+    except Exception:
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
+def email_submit_timeout_error(email, submitted, diag=None, received_codes=0):
+    """邮箱步骤超时。限流单独抛出；其余错误带上当时页面上的控件和提示。"""
+    snapshot = diag if isinstance(diag, dict) else {}
+    notice = str(snapshot.get("notice") or "").strip()
+    matched = looks_like_email_code_rate_limit(notice) or looks_like_email_code_rate_limit(
+        str(snapshot.get("body") or "")
+    )
+    if not matched and submitted and int(received_codes or 0) >= 2:
+        matched = "同一邮箱已多次收取验证码，提交后页面仍未进入验证码步骤"
+    if matched:
+        cls = _deps.get("EmailCodeRateLimited")
+        if cls is None:
+            detail = f"{matched} | 邮箱: {email}" if email and email not in matched else matched
+            return Exception(detail)
+        return cls(email=email, message=matched)
+    url = snapshot.get("url") or (page.url if page else "")
+    inputs = " | ".join(str(item) for item in (snapshot.get("inputs") or [])[:6])
+    buttons = " | ".join(str(item) for item in (snapshot.get("buttons") or [])[:8])
+    hint = f"; 页面提示={notice}" if notice else ""
+    visible = f"url={url}{hint}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
+    if submitted:
+        return Exception(f"邮箱已填写但页面未进入验证码步骤: {visible}")
+    return Exception(f"未找到邮箱输入框或注册按钮，最后页面: {visible}")
+
+
 def _has_code_verification_input() -> bool:
     """检测当前页面是否已经进入邮箱验证码阶段。
 
@@ -829,14 +988,15 @@ def _email_page_advanced_once(email):
 
     判定“已前进”的依据：
       - 出现验证码输入框（OTP / code 输入），或
-      - 原本可见可用的邮箱输入框已消失/不可用
+      - 邮箱输入框已经从页面消失。提交过程中被禁用的邮箱框仍算停在邮箱页。
 
     返回:
       - True：页面已前进，提交生效
       - False：仍停留在邮箱输入页
     """
-    # 域名被拒时仍停在邮箱页，优先抛出明确错误
+    # 域名被拒或验证码被限流时仍停在邮箱页，优先抛出明确错误
     raise_if_email_domain_rejected(email)
+    raise_if_email_code_rate_limited(email)
     try:
         return bool(
             page.run_js(
@@ -872,9 +1032,10 @@ const codeInput = Array.from(document.querySelectorAll('input')).find((node) => 
     );
 });
 if (codeInput) return true;
-// 2. 邮箱输入框已消失/不可用 => 已前进
+// 2. 邮箱输入框已从页面消失 => 已前进。
+// 提交中的输入框可能被禁用，不能把禁用当成已经进入验证码页。
 const emailInput = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"], input[placeholder*="mail" i], input[aria-label*="mail" i]'))
-    .find((node) => isVisible(node) && !node.disabled && !node.readOnly);
+    .find((node) => isVisible(node));
 if (!emailInput) return true;
 return false;
                 """
@@ -896,10 +1057,12 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         raise_if_email_domain_rejected(email)
+        raise_if_email_code_rate_limited(email)
         if _email_page_advanced_once(email):
             return True
         sleep_with_cancel(0.4, cancel_callback)
     raise_if_email_domain_rejected(email)
+    raise_if_email_code_rate_limited(email)
     return False
 
 
@@ -936,16 +1099,21 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     deadline = time.time() + timeout
     last_diag_time = 0
     last_reclick_time = 0
-    last_snapshot = None
     last_submit_clicked_at = None
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        raise_if_email_domain_rejected(email)
+        raise_if_email_code_rate_limited(email)
         # 邮箱提交后的跳转有时超过 _wait_email_page_advanced 的短确认窗口。
         # 一旦本轮确实点过提交，后续看到验证码框就直接交给验证码步骤处理。
         if last_submit_clicked_at is not None and _has_code_verification_input():
             if log_callback:
                 log_callback(f"[*] 邮箱提交后已延迟进入验证码页: {email}")
             return email, dev_token, last_submit_clicked_at
+        # 提交后先等页面给出限流或验证码，不要连点把同一地址继续打进频率限制。
+        if last_submit_clicked_at is not None and time.time() - last_submit_clicked_at < 8:
+            sleep_with_cancel(0.4, cancel_callback)
+            continue
         native_filled = _native_fill_email(email)
         if native_filled:
             filled = {"state": "filled", "source": "native", "url": page.url if page else ""}
@@ -1048,8 +1216,6 @@ return {
                 email,
             )
         state = filled.get("state") if isinstance(filled, dict) else filled
-        if isinstance(filled, dict):
-            last_snapshot = filled
         if state == "not-ready":
             now = time.time()
             if last_submit_clicked_at is not None and _has_code_verification_input():
@@ -1247,14 +1413,20 @@ return 'enter';
             log_callback(f"[*] 邮箱提交后已延迟进入验证码页: {email}")
         return email, dev_token, last_submit_clicked_at
     raise_if_email_domain_rejected(email)
-    if last_snapshot:
-        inputs = " | ".join(last_snapshot.get("inputs", [])[:6])
-        buttons = " | ".join(last_snapshot.get("buttons", [])[:8])
-        url = last_snapshot.get("url", page.url if page else "")
-        raise Exception(
-            f"未找到邮箱输入框或注册按钮，最后页面: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
-        )
-    raise Exception("未找到邮箱输入框或注册按钮")
+    raise_if_email_code_rate_limited(email)
+    received_codes = 0
+    counter = _deps.get("received_code_count")
+    if callable(counter):
+        try:
+            received_codes = int(counter(email) or 0)
+        except Exception:
+            received_codes = 0
+    raise email_submit_timeout_error(
+        email,
+        last_submit_clicked_at is not None,
+        _email_form_diagnostic(),
+        received_codes=received_codes,
+    )
 
 
 def fill_code_and_submit(

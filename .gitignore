@@ -63,3 +63,4 @@ _archive/
 # Web console
 front/node_modules/
 camoufox-cache/
+.playwright-mcp/

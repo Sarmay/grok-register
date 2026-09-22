@@ -20,6 +20,7 @@ import {
   X,
   XCircle,
 } from "lucide-react";
+import { BrowserStage } from "@/components/BrowserStage";
 import { HighlightedLogLine } from "@/components/HighlightedLogLine";
 import { LogSearchField } from "@/components/LogSearchField";
 import { api, type AccountRecord, type JobStatus, type LogItem } from "@/lib/api";
@@ -646,7 +647,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     <div className="space-y-5 sm:space-y-6">
       <PageHeader
         title="运行监控"
-        description="查看任务进度、实时日志与结果摘要；次要操作收在抽屉和弹框，主页面专注盯进度与日志。"
+        description="查看任务进度、浏览器画面、实时日志与结果摘要。画面是容器里的虚拟屏幕，只读。"
         actions={
           <>
             <Badge variant={job?.running ? "warning" : job?.last_error ? "destructive" : "success"}>
@@ -786,7 +787,8 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
         </CardContent>
       </Card>
 
-      
+      <BrowserStage workers={Number(job?.workers ?? workers) || 1} />
+
       {/* 本次结果：默认折叠，标题显示成功/失败 */}
       {(() => {
         const PREVIEW_LIMIT = 20;

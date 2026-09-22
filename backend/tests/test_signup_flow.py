@@ -175,6 +175,56 @@ class SignupFlowTests(unittest.TestCase):
         exc = signup_flow.AccountAlreadyRegistered("fixture")
         self.assertEqual(engine.classify_failure(exc), engine.FAIL_ALREADY_REGISTERED)
 
+    def test_detects_too_many_code_requests(self):
+        page = mock.Mock()
+        page.run_js.return_value = (
+            "Too many code requests. Please wait a few minutes before requesting another code."
+        )
+        signup_flow.configure(EmailCodeRateLimited=engine.EmailCodeRateLimited)
+        with mock.patch.object(signup_flow, "page", page):
+            with self.assertRaises(engine.EmailCodeRateLimited) as caught:
+                signup_flow.raise_if_email_code_rate_limited("limited@outlook.com")
+        self.assertIn("limited@outlook.com", str(caught.exception))
+        self.assertEqual(engine.classify_failure(caught.exception), engine.FAIL_CODE_RATE)
+
+    def test_email_timeout_reports_visible_controls_and_rate_limit(self):
+        signup_flow.configure(EmailCodeRateLimited=engine.EmailCodeRateLimited)
+        rate_limited = signup_flow.email_submit_timeout_error(
+            "limited@outlook.com",
+            True,
+            {
+                "url": "https://accounts.x.ai/sign-up?redirect=grok-com",
+                "inputs": ["type=email name=email"],
+                "buttons": ["Sign up", "Go back"],
+                "notice": "Too many code requests. Please wait a few minutes before requesting another code.",
+            },
+        )
+        self.assertIsInstance(rate_limited, engine.EmailCodeRateLimited)
+        stuck = signup_flow.email_submit_timeout_error(
+            "limited@outlook.com",
+            True,
+            {
+                "url": "https://accounts.x.ai/sign-up?redirect=grok-com",
+                "inputs": ["type=email name=email"],
+                "buttons": ["Sign up disabled", "Go back"],
+                "notice": "",
+            },
+        )
+        self.assertIn("邮箱已填写但页面未进入验证码步骤", str(stuck))
+        self.assertIn("type=email name=email", str(stuck))
+        self.assertIn("Sign up disabled", str(stuck))
+        repeated = signup_flow.email_submit_timeout_error(
+            "limited@outlook.com",
+            True,
+            {
+                "url": "https://accounts.x.ai/sign-up?redirect=grok-com",
+                "inputs": ["type=email name=email"],
+                "buttons": ["Sign up disabled"],
+            },
+            received_codes=2,
+        )
+        self.assertIsInstance(repeated, engine.EmailCodeRateLimited)
+
     def test_code_submission_accepts_native_button_label(self):
         logs = []
         page = mock.Mock()

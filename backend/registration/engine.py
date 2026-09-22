@@ -70,6 +70,7 @@ from backend.registration.signup_flow import (
     open_signup_page,
     has_profile_form,
     detect_email_domain_rejection,
+    looks_like_email_code_rate_limit,
     raise_if_email_domain_rejected,
     fill_email_and_submit,
     fill_code_and_submit,
@@ -403,6 +404,18 @@ class AccountRetryNeeded(Exception):
     pass
 
 
+class EmailCodeRateLimited(Exception):
+    """xAI 限制同一邮箱在短时间内再次索取验证码。"""
+
+    def __init__(self, email="", message=""):
+        self.email = email or ""
+        self.message = message or "验证码请求过多"
+        detail = self.message
+        if self.email and self.email not in detail:
+            detail = f"{detail} | 邮箱: {self.email}"
+        super().__init__(detail)
+
+
 class EmailDomainRejected(Exception):
     """xAI 拒绝当前邮箱域名（如公共临时域被拉黑）。"""
 
@@ -528,6 +541,7 @@ FAIL_DOMAIN = "domain_rejected"
 FAIL_ALREADY_REGISTERED = "already_registered"
 FAIL_RISK = "registration_risk"
 FAIL_CODE = "code_timeout"
+FAIL_CODE_RATE = "code_rate_limited"
 FAIL_BROWSER = "browser"
 FAIL_CPA = "cpa"
 FAIL_STUCK = "stuck_retry"
@@ -540,6 +554,7 @@ FAIL_LABELS = {
     FAIL_ALREADY_REGISTERED: "账号已注册",
     FAIL_RISK: "注册风控",
     FAIL_CODE: "验证码超时",
+    FAIL_CODE_RATE: "验证码限流",
     FAIL_BROWSER: "浏览器断开",
     FAIL_CPA: "CPA失败",
     FAIL_STUCK: "流程卡住",
@@ -562,6 +577,9 @@ def classify_failure(exc) -> str:
         looks_like_invalid_credentials,
     )
 
+    msg = str(exc or "")
+    if isinstance(exc, EmailCodeRateLimited) or looks_like_email_code_rate_limit(msg):
+        return FAIL_CODE_RATE
     if isinstance(exc, EmailDomainRejected):
         return FAIL_DOMAIN
     if isinstance(exc, _rf.AccountAlreadyRegistered):
@@ -570,7 +588,6 @@ def classify_failure(exc) -> str:
         return FAIL_RISK
     if isinstance(exc, InvalidLoginCredentials):
         return FAIL_INVALID_CREDENTIALS
-    msg = str(exc or "")
     low = msg.lower()
     if looks_like_invalid_credentials(msg) or "账号或密码错误" in msg:
         return FAIL_INVALID_CREDENTIALS
@@ -1145,6 +1162,8 @@ def settle_mailnest_email(email, exc=None, *, sso="", failure_type="", log_callb
     if str(sso or "").strip():
         mailnest_provider.drop_order(address)
         return "discarded"
+    if isinstance(exc, EmailCodeRateLimited) or looks_like_email_code_rate_limit(str(exc or "")):
+        return _cool_mailnest_after_code_rate_limit(address, log_callback)
     kind = failure_type or (classify_failure(exc) if exc is not None else "")
     if kind == FAIL_SSO and mailnest_provider.prepare_sso_timeout_retry(address):
         _mailnest_log(log_callback, f"[!] SSO 超时，同一 MailNest 邮箱再试一次: {address}")
@@ -1160,6 +1179,49 @@ def settle_mailnest_email(email, exc=None, *, sso="", failure_type="", log_callb
         _mailnest_log(log_callback, f"[*] MailNest 邮箱剩余时间不足，不再复用: {address}")
         return "discarded"
     return _mailnest_release(address, log_callback)
+
+
+def _cool_mailnest_after_code_rate_limit(email: str, log_callback=None) -> str:
+    """已扣费邮箱先冷却，避免下一轮立刻再打到 xAI 的验证码频率限制。"""
+    address = str(email or "").strip()
+    if not mailnest_provider.code_was_received(address):
+        action = _mailnest_release(address, log_callback)
+        if action != "reused":
+            return action
+    if mailnest_provider.park_code_rate_limit(address):
+        minutes = max(mailnest_provider.CODE_RATE_COOLDOWN_SECONDS // 60, 1)
+        _mailnest_log(
+            log_callback,
+            f"[*] MailNest 验证码请求过多，{minutes} 分钟内不再复用: {address}",
+        )
+        return "cooled"
+    mailnest_provider.drop_order(address)
+    _mailnest_log(log_callback, f"[*] MailNest 验证码请求过多且剩余时间不足，不再复用: {address}")
+    return "discarded"
+
+
+def _rotate_mailnest_after_code_rate_limit(
+    exc,
+    email,
+    *,
+    log_callback,
+    cancel_callback,
+    mail_try,
+    max_mail_retry,
+):
+    address = current_attempt_email(email, exc) or mailnest_provider.active_email()
+    settle_mailnest_email(
+        address,
+        exc,
+        failure_type=FAIL_CODE_RATE,
+        log_callback=log_callback,
+    )
+    if log_callback:
+        log_callback(
+            f"[!] 邮箱验证码请求过多，更换邮箱重试 ({mail_try}/{max_mail_retry}): {exc}"
+        )
+    restart_browser(log_callback=log_callback, cancel_callback=cancel_callback)
+    sleep_with_cancel(1, cancel_callback)
 
 
 def get_outlookemail_api_base():
@@ -3132,8 +3194,10 @@ def _wire_runtime_modules():
         sleep_with_cancel=sleep_with_cancel,
         RegistrationCancelled=RegistrationCancelled,
         EmailDomainRejected=EmailDomainRejected,
+        EmailCodeRateLimited=EmailCodeRateLimited,
         AccountRetryNeeded=AccountRetryNeeded,
         email_unavailable=email_registered_successfully,
+        received_code_count=mailnest_provider.received_code_count,
         prepare_exit_ip=prepare_registration_exit_ip,
     )
 
@@ -3340,14 +3404,29 @@ def run_registration(count):
                     }
                     nsfw_status = "未执行"
                     try:
-                        open_signup_page(
-                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
-                        email, dev_token, submitted_at = fill_email_and_submit(
-                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
+                        max_mail_retry = 3
+                        for mail_try in range(1, max_mail_retry + 1):
+                            open_signup_page(
+                                log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                                cancel_callback=controller.should_stop,
+                            )
+                            try:
+                                email, dev_token, submitted_at = fill_email_and_submit(
+                                    log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                                    cancel_callback=controller.should_stop,
+                                )
+                                break
+                            except EmailCodeRateLimited as exc:
+                                if mail_try >= max_mail_retry:
+                                    raise
+                                _rotate_mailnest_after_code_rate_limit(
+                                    exc,
+                                    email,
+                                    log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                                    cancel_callback=controller.should_stop,
+                                    mail_try=mail_try,
+                                    max_mail_retry=max_mail_retry,
+                                )
                         code = fill_code_and_submit(
                             email,
                             dev_token,
@@ -3674,9 +3753,22 @@ def run_registration(count):
                         log_callback=registration_log, cancel_callback=controller.should_stop
                     )
                     registration_log("[*] 2. 创建邮箱并提交")
-                    email, dev_token, submitted_at = fill_email_and_submit(
-                        log_callback=registration_log, cancel_callback=controller.should_stop
-                    )
+                    try:
+                        email, dev_token, submitted_at = fill_email_and_submit(
+                            log_callback=registration_log, cancel_callback=controller.should_stop
+                        )
+                    except EmailCodeRateLimited as exc:
+                        if mail_try >= max_mail_retry:
+                            raise
+                        _rotate_mailnest_after_code_rate_limit(
+                            exc,
+                            email,
+                            log_callback=registration_log,
+                            cancel_callback=controller.should_stop,
+                            mail_try=mail_try,
+                            max_mail_retry=max_mail_retry,
+                        )
+                        continue
                     registration_log(f"[*] 邮箱: {email}")
                     registration_log(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ''))})")
                     try:

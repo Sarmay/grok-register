@@ -66,6 +66,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "[docker] DISPLAY=${DISPLAY:-:99}"
 echo "[docker] 浏览器后端: Camoufox / CloakBrowser（由配置选择，默认 Camoufox）"
 echo "[docker] 浏览器模式: 有头（Xvfb 虚拟显示器）"
+echo "[docker] 浏览器画面: Web 运行监控页"
 echo "[docker] 配置: $CONFIG_FILE"
 echo "[docker] 数据: $DATA_DIR"
 echo "[docker] 日志: $LOG_FILE"

@@ -20,11 +20,12 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .account_exports import build_account_auth_archive, build_sso_archive, read_sso_token
+from .browser_view import get_browser_view
 from .jobs import job_coordinator
 from .relogin_jobs import relogin_coordinator
 from .sso_check_jobs import sso_check_coordinator
@@ -1588,6 +1589,21 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"终止浏览器失败: {exc}") from exc
         return {"ok": True, **result, "job": job_coordinator.status()}
+
+    @app.get("/api/browser/view")
+    def api_browser_view() -> Dict[str, Any]:
+        return {"ok": True, **get_browser_view().status()}
+
+    @app.get("/api/browser/view.jpg")
+    def api_browser_view_jpeg():
+        frame = get_browser_view().frame()
+        if not frame:
+            return Response(status_code=204)
+        return Response(
+            content=frame,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/browser/cache")
     def api_browser_cache() -> Dict[str, Any]:

@@ -17,6 +17,8 @@ from backend.mailbox.utilities import extract_verification_code
 API_BASE = "https://mailnest.top"
 DEFAULT_PROJECT_CODE = "x-ai001"
 REUSE_MARGIN_SECONDS = 180
+# xAI 对同一地址的验证码请求会限流，页面写 “a few minutes”，实际可超过 30 分钟。
+CODE_RATE_COOLDOWN_SECONDS = 60 * 60
 ALREADY_CHARGED = "D0004"
 
 HttpPost = Callable[..., Any]
@@ -33,6 +35,7 @@ class MailOrder:
     sso_timeout_reused: bool = False
     used_codes: set[str] = field(default_factory=set)
     last_received_at: float = 0.0
+    code_rate_limited_until: float = 0.0
 
     def remaining_seconds(self, now: Optional[float] = None) -> int:
         if not self.expired_at:
@@ -111,6 +114,13 @@ def code_was_received(email: str) -> bool:
     return bool(order and order.code_received)
 
 
+def received_code_count(email: str) -> int:
+    order = get_order(email)
+    if order is None:
+        return 0
+    return len(order.used_codes)
+
+
 def remember_received_code(email: str, code: str, received_at: float = 0.0) -> None:
     order = get_order(email)
     if order is None:
@@ -133,6 +143,10 @@ def claim_reusable(blocked: Optional[BlockedEmail] = None, now: Optional[float] 
                 continue
             if blocked and blocked(email):
                 _available.pop(email, None)
+                continue
+            if order.code_rate_limited_until and current < order.code_rate_limited_until:
+                if not order.reusable(order.code_rate_limited_until):
+                    _available.pop(email, None)
                 continue
             if not order.reusable(current):
                 _available.pop(email, None)
@@ -169,6 +183,33 @@ def recycle_order(email: str, *, reason: str = "", now: Optional[float] = None) 
             return False
         if reason == "sso_timeout":
             order.sso_timeout_reused = True
+        _inflight.pop(key, None)
+        _available[key] = order
+    if active_email() == key:
+        _remember_active("")
+    return True
+
+
+def park_code_rate_limit(
+    email: str,
+    cooldown: int = CODE_RATE_COOLDOWN_SECONDS,
+    now: Optional[float] = None,
+) -> bool:
+    """验证码被限流后进入冷却。冷却结束仍未过期才继续复用。"""
+    key = str(email or "").strip()
+    current = time.time() if now is None else now
+    wait = max(int(cooldown or 0), 0)
+    with _pool_lock:
+        order = _inflight.get(key) or _available.get(key)
+        if order is None:
+            return False
+        order.code_rate_limited_until = current + wait
+        if not order.reusable(order.code_rate_limited_until):
+            _inflight.pop(key, None)
+            _available.pop(key, None)
+            if active_email() == key:
+                _remember_active("")
+            return False
         _inflight.pop(key, None)
         _available[key] = order
     if active_email() == key:

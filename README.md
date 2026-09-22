@@ -54,7 +54,7 @@ docker compose logs -f grok-register
 curl http://127.0.0.1:8787/api/health
 ```
 
-容器内使用 **Xvfb + 有头浏览器**，服务器不需要桌面环境。默认后端仍是 Camoufox，可在设置页切换 CloakBrowser；Docker 模式会强制关闭无头模式。
+容器内使用 **Xvfb + 有头浏览器**，服务器不需要桌面环境。默认后端仍是 Camoufox，可在设置页切换 CloakBrowser；Docker 模式会强制关闭无头模式。运行监控页会显示这块虚拟屏幕上的浏览器画面。
 
 如果配置里的代理是 `127.0.0.1:7897`，Compose 会自动映射到宿主机代理。宿主机代理软件需要允许局域网连接（监听 `0.0.0.0` 或 Docker 网桥地址）。
 

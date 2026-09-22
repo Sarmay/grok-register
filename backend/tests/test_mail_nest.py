@@ -67,6 +67,58 @@ class MailNestPoolTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["email"], "fresh@outlook.com")
         self.assertIsNone(mail_nest.get_order("fresh@outlook.com"))
 
+    def test_rate_limited_mailbox_stays_out_until_cooldown_ends(self):
+        order = mail_nest.MailOrder(
+            email="limited@outlook.com",
+            expired_at=time.time() + 7200,
+            code_received=True,
+        )
+        mail_nest.track_order(order)
+        now = time.time()
+        action = gr.settle_mailnest_email(
+            "limited@outlook.com",
+            gr.EmailCodeRateLimited(
+                "limited@outlook.com",
+                "Too many code requests. Please wait a few minutes before requesting another code.",
+            ),
+        )
+        self.assertEqual(action, "cooled")
+        self.assertIsNone(mail_nest.claim_reusable(None, now=now + 60))
+        claimed = mail_nest.claim_reusable(
+            None,
+            now=now + mail_nest.CODE_RATE_COOLDOWN_SECONDS + 5,
+        )
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.email, "limited@outlook.com")
+
+    def test_rate_limit_text_also_cools_the_mailbox(self):
+        order = mail_nest.MailOrder(
+            email="limited-text@outlook.com",
+            expired_at=time.time() + 7200,
+            code_received=True,
+        )
+        mail_nest.track_order(order)
+        action = gr.settle_mailnest_email(
+            "limited-text@outlook.com",
+            RuntimeError("Too many code requests. Please wait a few minutes before requesting another code."),
+        )
+        self.assertEqual(action, "cooled")
+        self.assertIsNone(mail_nest.claim_reusable(None))
+
+    def test_rate_limited_mailbox_expiring_inside_cooldown_is_dropped(self):
+        order = mail_nest.MailOrder(
+            email="expiring@outlook.com",
+            expired_at=time.time() + mail_nest.CODE_RATE_COOLDOWN_SECONDS + 60,
+            code_received=True,
+        )
+        mail_nest.track_order(order)
+        action = gr.settle_mailnest_email(
+            "expiring@outlook.com",
+            gr.EmailCodeRateLimited("expiring@outlook.com", "验证码请求过多"),
+        )
+        self.assertEqual(action, "discarded")
+        self.assertIsNone(mail_nest.get_order("expiring@outlook.com"))
+
     def test_charged_mailbox_is_reused_after_later_failure(self):
         order = mail_nest.MailOrder(
             email="used@outlook.com",

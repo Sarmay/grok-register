@@ -53,7 +53,7 @@ ENV PATH=/opt/venv/bin:$PATH \
 # Camoufox/Firefox 与 CloakBrowser/Chromium 有头模式依赖 + Xvfb 虚拟显示器。
 COPY --chmod=755 docker/apt-retry.sh /usr/local/bin/apt-retry.sh
 RUN apt-retry.sh \
-        ca-certificates dumb-init gosu procps python3 xvfb xauth \
+        ca-certificates dumb-init ffmpeg gosu procps python3 xvfb xauth \
         libasound2t64 libatk1.0-0t64 libavcodec60 \
         libatk-bridge2.0-0t64 libatspi2.0-0t64 libcups2t64 \
         libcairo-gobject2 libcairo2 libdbus-1-3 \

@@ -34,6 +34,18 @@ export type BrowserCacheSnapshot = {
   entries: BrowserCacheEntry[];
 };
 
+export type BrowserViewStatus = {
+  ok: boolean;
+  enabled: boolean;
+  display: string;
+  capturing: boolean;
+  has_frame: boolean;
+  updated_at?: number | null;
+  age_seconds?: number | null;
+  error?: string;
+  reason?: string;
+};
+
 export type JobStatus = {
   running: boolean;
   started_at?: number | null;
@@ -542,6 +554,26 @@ export const api = {
       "/api/browser/kill-all",
       { method: "POST" }
     ),
+  browserView: () => request<BrowserViewStatus>("/api/browser/view"),
+  browserViewFrame: async () => {
+    const response = await fetch("/api/browser/view.jpg", { cache: "no-store" });
+    if (response.status === 204) return null;
+    if (!response.ok) {
+      let data: any = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+      if (response.status === 401 && data?.auth_required) {
+        window.dispatchEvent(
+          new CustomEvent("grok-auth-required", { detail: { setupRequired: !!data?.setup_required } })
+        );
+      }
+      throw new Error(data?.detail || data?.error || `画面获取失败 (${response.status})`);
+    }
+    return response.blob();
+  },
   browserCache: () => request<{ ok: boolean } & BrowserCacheSnapshot>("/api/browser/cache"),
   clearBrowserCache: () =>
     request<{ ok: boolean } & BrowserCacheSnapshot>("/api/browser/cache/clear", { method: "POST" }),
