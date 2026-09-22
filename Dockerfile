@@ -12,7 +12,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 ENV PATH=/opt/venv/bin:$PATH \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    XDG_CACHE_HOME=/opt/camoufox-cache
+    XDG_CACHE_HOME=/opt/camoufox-cache \
+    CAMOUFOX_INSTALL_DIR=/opt/camoufox-cache
 
 COPY --chmod=755 docker/apt-retry.sh /usr/local/bin/apt-retry.sh
 RUN apt-retry.sh ca-certificates python3 python3-pip python3-venv
@@ -24,7 +25,8 @@ RUN python3 -m venv /opt/venv \
     && pip install -r requirements.txt
 
 # 浏览器引擎直接内置到镜像，容器首次启动时不再临时下载。
-RUN python -m camoufox fetch \
+RUN python -m playwright install-deps || true \
+    && python -m camoufox fetch \
     && python -m camoufox version
 
 FROM ubuntu:24.04 AS runtime
@@ -38,6 +40,7 @@ ENV PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/home/app \
     XDG_CACHE_HOME=/opt/camoufox-cache \
+    CAMOUFOX_INSTALL_DIR=/opt/camoufox-cache \
     CLOAKBROWSER_CACHE_DIR=/app/data/cloakbrowser-cache \
     CLOAKBROWSER_AUTO_UPDATE=false \
     DISPLAY=:99 \
