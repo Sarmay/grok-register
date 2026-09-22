@@ -27,7 +27,8 @@ RUN python3 -m venv /opt/venv \
 # 浏览器引擎直接内置到镜像，容器首次启动时不再临时下载。
 RUN python -m playwright install-deps || true \
     && python -m camoufox fetch \
-    && python -m camoufox version
+    && python -m camoufox version \
+    && python -c "from camoufox.pkgman import installed_verstr, launch_path; print(f'Camoufox installed: {installed_verstr()} ({launch_path()})')"
 
 FROM ubuntu:24.04 AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
