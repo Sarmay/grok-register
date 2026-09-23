@@ -12,12 +12,23 @@ import threading
 import time
 from typing import Any, Deque, Dict, List, Optional
 
+from backend.web.task_history import (
+    KIND_REGISTRATION,
+    TaskRunRecorder,
+    now_iso,
+    prune_history,
+)
+
 
 class RegistrationJobCoordinator:
-    """Single-flight registration runner with ring-buffer logs."""
+    """Single-flight registration runner with ring-buffer logs.
+
+    内存里的环形日志只给运行监控页；每行同时按批次号写进 SQLite，供任务历史页回看。
+    """
 
     def __init__(self, max_logs: int = 2000):
         self._lock = threading.RLock()
+        self._recorder: Optional[TaskRunRecorder] = None
         self._logs: Deque[Dict[str, Any]] = collections.deque(maxlen=max(100, int(max_logs)))
         self._log_seq = 0
         self._running = False
@@ -47,6 +58,19 @@ class RegistrationJobCoordinator:
             return gr.get_registration_repository()
         except Exception:
             return None
+
+    def _run_summary(self) -> Dict[str, Any]:
+        """写进任务历史的摘要；调用方需持有锁。"""
+        return {
+            "target_count": self._target_count,
+            "workers": self._workers,
+            "source": self._source,
+            "completed_count": self._completed_count,
+            "success_count": self._success_count,
+            "failure_count": self._failure_count,
+            "current_stage": self._current_stage,
+            "last_error": self._last_error,
+        }
 
     def _snapshot_payload(self) -> Dict[str, Any]:
         return {
@@ -142,6 +166,13 @@ class RegistrationJobCoordinator:
         # 若快照标记仍在 running，写回为已中断，避免下次启动重复提示逻辑混乱
         if snap and snap.get("running"):
             self._persist_snapshot(force=True)
+            if batch_id:
+                try:
+                    repo.mark_task_run_interrupted(
+                        KIND_REGISTRATION, batch_id, error="服务重启，上次任务未正常收尾"
+                    )
+                except Exception:
+                    pass
 
     def _update_progress_from_log(self, message: str) -> bool:
         """根据日志更新进度；返回 completed_count 是否变化。"""
@@ -211,15 +242,19 @@ class RegistrationJobCoordinator:
     def _append_log(self, message: str) -> None:
         text = str(message or "")
         progress_changed = self._update_progress_from_log(text)
+        stamp = now_iso()
         with self._lock:
             self._log_seq += 1
-            self._logs.append(
-                {
-                    "id": self._log_seq,
-                    "time": time.strftime("%H:%M:%S"),
-                    "message": text,
-                }
-            )
+            entry = {
+                "id": self._log_seq,
+                "time": stamp[11:19],
+                "timestamp": stamp,
+                "message": text,
+            }
+            self._logs.append(entry)
+            recorder = self._recorder
+        if recorder is not None:
+            recorder.append(entry["id"], text, stamp)
         if progress_changed:
             self._persist_snapshot(force=True)
 
@@ -274,6 +309,10 @@ class RegistrationJobCoordinator:
         with self._lock:
             if self._running:
                 raise RuntimeError("已有注册任务在运行")
+            # 批次号在这里就定下来，第一行日志起就能按批次落盘；
+            # 引擎内部生成批次号时会拿回这个值，保证和账号记录一致。
+            batch_id = gr.new_registration_batch_id("web")
+            self._recorder = TaskRunRecorder(KIND_REGISTRATION, batch_id, self._repository)
             self._running = True
             self._started_at = time.time()
             self._finished_at = None
@@ -287,9 +326,13 @@ class RegistrationJobCoordinator:
             self._failure_count = 0
             self._current_stage = "任务启动中"
             self._current_email = ""
-            self._batch_id = ""
+            self._batch_id = batch_id
             self._append_log(f"[*] Web 任务启动：数量={count} 并发={workers}")
+            summary = self._run_summary()
+            started_at = self._started_at
 
+        prune_history(self._repository(), gr.config, KIND_REGISTRATION)
+        self._recorder.begin(started_at, summary)
         self._persist_snapshot(force=True)
 
         manager = self
@@ -340,9 +383,12 @@ class RegistrationJobCoordinator:
                 original_new_batch_id = gr.new_registration_batch_id
 
                 def capture_batch_id(source="web"):
-                    batch_id = original_new_batch_id(source)
                     with manager._lock:
-                        manager._batch_id = str(batch_id or "")
+                        batch_id = manager._batch_id
+                    if not batch_id:
+                        batch_id = original_new_batch_id(source)
+                        with manager._lock:
+                            manager._batch_id = str(batch_id or "")
                     manager._append_log(f"[*] 任务批次: {batch_id}")
                     manager._persist_snapshot(force=True)
                     return batch_id
@@ -373,10 +419,26 @@ class RegistrationJobCoordinator:
                     )
                 manager._append_log("[*] Web 任务已结束")
                 manager._persist_snapshot(force=True)
+                manager._finish_history()
 
         self._thread = threading.Thread(target=runner, name="web-registration", daemon=True)
         self._thread.start()
         return self.status()
+
+    def _finish_history(self) -> None:
+        recorder = self._recorder
+        if recorder is None:
+            return
+        with self._lock:
+            summary = self._run_summary()
+            finished_at = self._finished_at
+            if self._last_error:
+                status = "failed"
+            elif self._completed_count < self._target_count:
+                status = "stopped"
+            else:
+                status = "finished"
+        recorder.finish(finished_at, status, summary)
 
     def request_stop(self) -> Dict[str, Any]:
         with self._lock:

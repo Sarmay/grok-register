@@ -34,6 +34,8 @@
   "browser_traffic_savings_level": "standard",
   "close_browser_on_stop": false,
   "log_level": "info",
+  "task_history_retention_days": 60,
+  "task_history_retention_count": 200,
   "register_count": 1,
   "register_workers": 1,
   "account_interval": "60-120",

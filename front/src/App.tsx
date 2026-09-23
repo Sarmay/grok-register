@@ -13,6 +13,7 @@ import { CredentialsPage } from "@/pages/Credentials";
 import { ConfigFilePage } from "@/pages/ConfigFile";
 import { SsoCheckHistoryPage, SsoCheckPage } from "@/pages/SsoCheck";
 import { FlaggedExitIpsPage } from "@/pages/FlaggedExitIps";
+import { TaskHistoryDetailPage, TaskHistoryPage } from "@/pages/TaskHistory";
 
 export default function App() {
   const [jobRunning, setJobRunning] = useState(false);
@@ -102,6 +103,8 @@ export default function App() {
         <Route path="accounts/credentials" element={<CredentialsPage />} />
         <Route path="registration/new" element={<RegisterPage view="new" />} />
         <Route path="registration/runtime" element={<RegisterPage view="runtime" />} />
+        <Route path="registration/history" element={<TaskHistoryPage />} />
+        <Route path="registration/history/:runId" element={<TaskHistoryDetailPage />} />
         <Route path="register" element={<Navigate to="/registration/new" replace />} />
         <Route path="settings/registration" element={<SettingsPage section="registration" />} />
         {/* TokenAuth 已并入注册设置，保留旧地址并默认打开授权转换 Tab */}

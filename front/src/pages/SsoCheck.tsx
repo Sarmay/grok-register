@@ -18,8 +18,9 @@ import { AccountEmailLabel, EmailProviderIcon, EmailProviderLabel } from "@/comp
 import { AccountFilterBar, AccountSelectionToolbar } from "@/components/AccountTableToolbar";
 import { Badge, Button, Card, EmptyState, Input, PageHeader, PaginationBar, Select, Toast } from "@/components/ui";
 import { api, type AccountRecord, type SsoCheckItem, type SsoCheckStatus } from "@/lib/api";
+import { LiveLogBoard } from "@/components/LiveLogBoard";
+import { api as historyApi, type LogItem } from "@/lib/api";
 import {
-  appendSsoCheckHistory,
   clearSsoCheckHistory,
   loadSsoCheckHistory,
   removeSsoCheckHistory,
@@ -264,7 +265,6 @@ export function SsoCheckPage() {
         setStatus(next);
         if (next.running) { timer = window.setTimeout(poll, 1500); return; }
         if (next.run_id && recordedRun.current !== next.run_id) {
-          await appendSsoCheckHistory(next);
           recordedRun.current = next.run_id;
           if (next.finished_at) void load();
         }
@@ -416,7 +416,15 @@ export function SsoCheckHistoryPage() {
   const [filter, setFilter] = useState<"all" | "clean" | "flagged" | "unknown">("all");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
-  useEffect(() => { void loadSsoCheckHistory().then(setEntries); }, []);
+  const [runLogs, setRunLogs] = useState<LogItem[]>([]);
+  useEffect(() => { void loadSsoCheckHistory().then(setEntries).catch(() => setEntries([])); }, []);
+  useEffect(() => {
+    setRunLogs([]);
+    if (!runId) return;
+    let active = true;
+    void historyApi.taskRunLogs("sso_check", runId).then((result) => { if (active) setRunLogs(result.logs || []); }).catch(() => undefined);
+    return () => { active = false; };
+  }, [runId]);
   const selected = entries.find((entry) => entry.run_id === runId) || null;
   const reportItems = useMemo(() => {
     if (!selected) return [];
@@ -435,10 +443,11 @@ export function SsoCheckHistoryPage() {
   if (runId) return (
     <div className="space-y-5">
       <AccountPageContext crumbs={[{ label: "SSO 风控", to: "/accounts/sso-check" }, { label: "检查历史", to: "/accounts/sso-check/history" }, { label: "报告" }]} backTo="/accounts/sso-check/history" backLabel="返回历史列表" />
-      {!selected ? <Card className="p-5"><EmptyState title="报告不存在" description="该报告可能已删除或浏览器数据已清理。" /></Card> : <>
+      {!selected ? <Card className="p-5"><EmptyState title="报告不存在" description="该报告可能已删除，或已按保留策略清理。" /></Card> : <>
         <PageHeader title="SSO 风控报告" description={`完成于 ${formatWhen(selected.finished_at)}`} actions={<Button variant="outline" className="text-red-700" onClick={() => void remove(selected.run_id)}><Trash2 className="h-4 w-4" />删除</Button>} />
         <section className="grid grid-cols-2 gap-3 lg:grid-cols-4">{[["账号", selected.total_count, "text-slate-950", CheckCircle2], ["正常", selected.clean_count, "text-emerald-700", ShieldCheck], ["异常", selected.flagged_count, "text-red-700", ShieldAlert], ["未知 / 失败", selected.unknown_count + selected.failed_count, "text-amber-700", AlertTriangle]].map(([label, value, tone, Icon]: any) => <Card key={label} className="p-4"><div className="flex items-center justify-between"><span className="text-xs text-slate-500">{label}</span><Icon className={`h-4 w-4 ${tone}`} /></div><div className={`mt-2 text-2xl font-semibold tabular-nums ${tone}`}>{value}</div></Card>)}</section>
         <Card className="overflow-hidden"><div className="flex flex-col gap-3 border-b border-slate-200 p-4 sm:flex-row"><div className="relative flex-1"><Search className="pointer-events-none absolute left-3 top-3.5 h-4 w-4 text-slate-400" /><Input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="搜索邮箱" className="pl-9" /></div><Select value={filter} onChange={(event) => { setFilter(event.target.value as typeof filter); setPage(1); }} className="sm:w-40" aria-label="筛选风控结果"><option value="all">全部结果</option><option value="clean">仅正常</option><option value="flagged">仅异常</option><option value="unknown">未知 / 失败</option></Select></div><SsoResultTable items={paged} />{reportItems.length ? <PaginationBar page={safePage} pageSize={pageSize} total={reportItems.length} onPageChange={setPage} onPageSizeChange={(size) => { setPageSize(size); setPage(1); }} /> : null}</Card>
+        {runLogs.length ? <LiveLogBoard logs={runLogs} running={false} title="运行日志" description="这次检查的服务端日志。" ariaLabel="SSO 检查日志" statusIdleLabel="已结束" /> : null}
       </>}
     </div>
   );
@@ -446,7 +455,7 @@ export function SsoCheckHistoryPage() {
   return (
     <div className="space-y-5">
       <AccountPageContext crumbs={[{ label: "SSO 风控", to: "/accounts/sso-check" }, { label: "检查历史" }]} />
-      <PageHeader title="SSO 检查历史" description="报告保存在当前浏览器，保留账号与风控关键信息。" actions={<Button variant="outline" className="text-red-700" disabled={!entries.length} onClick={async () => { if (!window.confirm("清空全部 SSO 检查历史？")) return; setEntries(await clearSsoCheckHistory()); }}><Trash2 className="h-4 w-4" />清空历史</Button>} />
+      <PageHeader title="SSO 检查历史" description="报告和运行日志保存在服务端数据库，任何浏览器登录后都能查看。" actions={<Button variant="outline" className="text-red-700" disabled={!entries.length} onClick={async () => { if (!window.confirm("清空全部 SSO 检查历史？")) return; setEntries(await clearSsoCheckHistory()); }}><Trash2 className="h-4 w-4" />清空历史</Button>} />
       {entries.length ? <section className="grid gap-3 xl:grid-cols-2">{entries.map((entry) => <Card key={entry.run_id} className="p-4 sm:p-5"><div className="flex items-start justify-between gap-3"><div><div className="flex items-center gap-2 text-sm font-semibold"><Clock3 className="h-4 w-4 text-sky-600" />{formatWhen(entry.finished_at)}</div><div className="mt-3 flex flex-wrap gap-1.5"><Badge variant="secondary">总数 {entry.total_count}</Badge><Badge variant="success">正常 {entry.clean_count}</Badge>{entry.flagged_count ? <Badge variant="destructive">异常 {entry.flagged_count}</Badge> : null}{entry.unknown_count + entry.failed_count ? <Badge variant="warning">未知/失败 {entry.unknown_count + entry.failed_count}</Badge> : null}</div></div><Button size="icon" variant="ghost" className="h-9 w-9 text-red-700" onClick={() => void remove(entry.run_id)}><Trash2 className="h-4 w-4" /></Button></div><Link to={`/accounts/sso-check/history/${entry.run_id}`} className="mt-4 inline-flex min-h-9 w-full items-center justify-center rounded-lg bg-slate-900 px-3 text-xs font-medium text-white">查看报告</Link></Card>)}</section> : <Card className="p-4"><EmptyState title="暂无检查历史" description="完成一次批量 SSO 详细检查后会在这里生成精简报告。" /></Card>}
     </div>
   );

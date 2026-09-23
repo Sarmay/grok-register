@@ -243,7 +243,9 @@ Windows 启动：
 | `grokiq_webhook_enabled` | 导入 Grok Build 后发送账号已导入 Webhook |
 | `grokiq_webhook_url` | GrokIQ `account-imported` 接口地址 |
 | `grokiq_webhook_token` | Webhook 请求头 `x-grokiq-token` |
-| `grokiq_webhook_timeout_seconds` | 单次投递超时；失败后由持久 Outbox 退避重试 |
+| `grokiq_webhook_timeout_seconds` | 单次投递超时；失败后由持久 Outbox 退避重试，连续失败约 8 小时后进入"投递放弃"，可在账号详情里手动重新投递 |
+| `task_history_retention_days` | 任务历史（注册批次 / 重新登录 / SSO 检查的日志与摘要）保留天数，默认 `60`，`0` 表示不按时间清理 |
+| `task_history_retention_count` | 每类任务最多保留的条数，默认 `200`，`0` 表示不限制；清理在每次任务启动时执行 |
 
 GrokIQ 检测完成后会发送回调通知 `POST /api/integrations/grokiq/notify`（请求头 `x-grokiq-token`，类似支付异步通知）。账号详情会显示是否降智，注册机不会据此自动删除账号。
 
@@ -290,6 +292,10 @@ docker compose run --rm grok-register python /app/docker/cloakbrowser_smoke.py
 # 前端构建
 cd front && npm run build
 ```
+
+## 任务历史
+
+每次注册任务从第一行日志起就按批次号（形如 `web-20260922_125044-b1658a`）写进 SQLite，服务重启后仍可在「注册中心 → 任务历史」回看完整日志和成功 / 失败统计，账号详情里可以直接跳到该账号那次注册的日志。重新登录和 SSO 检查的报告与运行日志也保存在服务端，不再依赖浏览器本地存储；旧版本留在浏览器里的报告会在第一次打开历史页时自动搬到服务端。日志时间戳带日期和时区，容器时区由 `.env` 的 `TZ` 决定，默认 `Asia/Shanghai`。
 
 ## 新版本检测
 

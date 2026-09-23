@@ -44,6 +44,7 @@ export function LiveLogBoard({
   statusRunningLabel = "日志持续同步中",
   statusIdleLabel = "等待新任务",
   extraMeta,
+  initialQuery = "",
   onClearView,
   onToast,
 }: {
@@ -58,13 +59,14 @@ export function LiveLogBoard({
   statusRunningLabel?: string;
   statusIdleLabel?: string;
   extraMeta?: string;
+  initialQuery?: string;
   onClearView?: () => void;
   onToast?: (message: string, tone?: "default" | "success" | "error") => void;
 }) {
   const [renderedLogLimit, setRenderedLogLimit] = useState(DEFAULT_RENDERED_LOGS);
   const [autoScroll, setAutoScroll] = useState(true);
   const [showJumpBottom, setShowJumpBottom] = useState(false);
-  const [logQuery, setLogQuery] = useState("");
+  const [logQuery, setLogQuery] = useState(initialQuery);
   const [logLevel, setLogLevel] = useState<"all" | LogTone>("all");
   const [activeMatchIndex, setActiveMatchIndex] = useState(0);
   const logRef = useRef<HTMLDivElement | null>(null);
@@ -168,7 +170,7 @@ export function LiveLogBoard({
   };
 
   const copyVisibleLogs = async () => {
-    const text = levelLogs.map((item) => `[${item.time}] ${item.message}`).join("\n");
+    const text = levelLogs.map((item) => `[${item.timestamp || item.time}] ${item.message}`).join("\n");
     if (!text) {
       onToast?.("没有可复制的日志", "error");
       return;

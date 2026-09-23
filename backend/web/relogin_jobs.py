@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional
 from urllib.parse import quote
 
+from backend.web.task_history import KIND_RELOGIN, TaskRunRecorder, now_iso, prune_history
+
 
 def enqueue_relogin_grokiq_notification(
     store: Any,
@@ -67,6 +69,30 @@ class ReloginJobCoordinator:
         self._logs: Deque[Dict[str, Any]] = collections.deque(maxlen=max(100, int(max_logs)))
         self._log_seq = 0
         self._stop_requested = False
+        self._recorder: Optional[TaskRunRecorder] = None
+
+    @staticmethod
+    def _repository() -> Any:
+        try:
+            from backend.registration import engine as gr
+
+            return gr.get_registration_repository()
+        except Exception:
+            return None
+
+    def _history_summary(self) -> Dict[str, Any]:
+        """写进任务历史的摘要：状态快照去掉实时日志相关字段。"""
+        summary = self.status()
+        for key in ("running", "stopping", "log_count", "latest_log_id"):
+            summary.pop(key, None)
+        return summary
+
+    def _finish_history(self, status: str) -> None:
+        recorder = self._recorder
+        if recorder is None:
+            return
+        summary = self._history_summary()
+        recorder.finish(summary.get("finished_at"), status, summary)
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
@@ -99,15 +125,19 @@ class ReloginJobCoordinator:
         text = str(message or "")
         if not text:
             return
+        stamp = now_iso()
         with self._lock:
             self._log_seq += 1
-            self._logs.append(
-                {
-                    "id": self._log_seq,
-                    "time": time.strftime("%H:%M:%S"),
-                    "message": text,
-                }
-            )
+            entry = {
+                "id": self._log_seq,
+                "time": stamp[11:19],
+                "timestamp": stamp,
+                "message": text,
+            }
+            self._logs.append(entry)
+            recorder = self._recorder
+        if recorder is not None:
+            recorder.append(entry["id"], text, stamp)
 
     def get_logs(self, after_id: int = 0, limit: int = 500) -> List[Dict[str, Any]]:
         safe_limit = max(1, min(int(limit or 500), 2000))
@@ -199,7 +229,10 @@ class ReloginJobCoordinator:
             self._items = seed_items
             self._logs.clear()
             self._stop_requested = False
+            self._recorder = TaskRunRecorder(KIND_RELOGIN, self._run_id, self._repository)
 
+        prune_history(self._repository(), getattr(gr, "config", {}), KIND_RELOGIN)
+        self._recorder.begin(self._started_at, self._history_summary())
         self._append_log(
             f"[*] 重新登录任务启动：共 {len(normalized_ids)} 个账号，可执行 {len(runnable)} 个"
         )
@@ -307,7 +340,9 @@ class ReloginJobCoordinator:
                         self._error = f"{self._failed_count} 个账号重新登录失败" if failed else ""
                     self._running = False
                     self._finished_at = time.time()
+                    stopped = self._stop_requested
                 self._append_log("[*] 重新登录任务已结束")
+                self._finish_history("stopped" if stopped else "finished")
 
         self._thread = threading.Thread(
             target=runner,
@@ -325,6 +360,7 @@ class ReloginJobCoordinator:
                 self._stage = "重新登录启动失败"
                 self._error = str(exc)
                 self._finished_at = time.time()
+            self._finish_history("failed")
             raise
         return self.status()
 

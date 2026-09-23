@@ -26,7 +26,6 @@ import { AccountBatchActions } from "@/components/AccountBatchActions";
 import { AccountEmailIcon, EmailProviderLabel, emailProviderLabel } from "@/components/AccountEmailIcon";
 import { AccountFilterBar, AccountSelectionToolbar } from "@/components/AccountTableToolbar";
 import { api, type AccountRecord, type ReloginStatus } from "@/lib/api";
-import { appendReloginHistory } from "@/lib/reloginHistory";
 import { cn, copyText, formatDuration, maskSecret } from "@/lib/utils";
 import {
   Badge,
@@ -550,6 +549,16 @@ function AccountDetails({
             邮箱 {emailDisableLabel(detail.email_disable_status)}
           </Badge>
         </div>
+        {detail.batch_id ? (
+          <div className="mt-2 text-xs">
+            <Link
+              to={`/registration/history/${encodeURIComponent(detail.batch_id)}?q=${encodeURIComponent(detail.email || "")}`}
+              className="font-medium text-sky-700 hover:underline"
+            >
+              查看这次注册的任务日志
+            </Link>
+          </div>
+        ) : null}
       </div>
 
       <CredentialErrorHint item={detail} />
@@ -963,8 +972,6 @@ export function AccountsPage() {
         const runId = next.run_id || "";
         // 将完成结果写入独立历史页；当前页面只保留轻量状态提示。
         if (runId && reportedRunIdRef.current !== runId) {
-          await appendReloginHistory(next);
-          if (!active) return;
           if (sawRunningRef.current) {
             await load();
             if (!active) return;
@@ -1127,7 +1134,6 @@ export function AccountsPage() {
     setReloginPolling(false);
     if (next.run_id) {
       setReloginReport(next);
-      await appendReloginHistory(next);
     }
     await load();
   };

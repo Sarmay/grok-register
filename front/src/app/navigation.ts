@@ -1,6 +1,7 @@
 import {
   Archive,
   FileJson2,
+  History,
   LayoutDashboard,
   Mail,
   MonitorDot,
@@ -44,6 +45,7 @@ export const navigationGroups: readonly NavigationGroup[] = [
     items: [
       { to: "/registration/new", label: "新建注册", shortLabel: "注册", icon: PlaySquare },
       { to: "/registration/runtime", label: "运行监控", shortLabel: "监控", icon: MonitorDot },
+      { to: "/registration/history", label: "任务历史", shortLabel: "历史", icon: History },
     ],
   },
   {

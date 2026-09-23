@@ -11,7 +11,8 @@ import {
   type ReloginHistoryEntry,
 } from "@/lib/reloginHistory";
 import { copyText } from "@/lib/utils";
-import { api, type AccountRecord, type ReloginItem } from "@/lib/api";
+import { api, type AccountRecord, type LogItem, type ReloginItem } from "@/lib/api";
+import { LiveLogBoard } from "@/components/LiveLogBoard";
 
 function formatWhen(value: number | null) {
   return value ? new Date(value * 1000).toLocaleString() : "时间未知";
@@ -58,10 +59,21 @@ export function ReloginHistoryPage() {
   const [reportPageSize, setReportPageSize] = useState(20);
   const [accountSnapshots, setAccountSnapshots] = useState<Record<number, AccountRecord>>({});
   const [toast, setToast] = useState("");
+  const [runLogs, setRunLogs] = useState<LogItem[]>([]);
 
   useEffect(() => {
-    void loadReloginHistory().then(setEntries);
+    void loadReloginHistory().then(setEntries).catch(() => setEntries([]));
   }, []);
+
+  useEffect(() => {
+    setRunLogs([]);
+    if (!runId) return;
+    let active = true;
+    void api.taskRunLogs("relogin", runId)
+      .then((result) => { if (active) setRunLogs(result.logs || []); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [runId]);
 
   const selected = entries.find((entry) => entry.run_id === runId) || null;
   const filtered = useMemo(() => {
@@ -119,7 +131,7 @@ export function ReloginHistoryPage() {
         <AccountPageContext crumbs={[{ label: "重新登录", to: "/accounts/relogin" }, { label: "登录历史", to: "/accounts/relogin/history" }, { label: "报告" }]} backTo="/accounts/relogin/history" backLabel="返回历史列表" />
         {!selected ? (
           <Card className="p-5">
-            <EmptyState title="报告不存在" description="该记录可能已被删除，或者浏览器数据已被清理。" />
+            <EmptyState title="报告不存在" description="该记录可能已被删除，或已按保留策略清理。" />
           </Card>
         ) : (
           <>
@@ -233,6 +245,17 @@ export function ReloginHistoryPage() {
                 />
               ) : null}
             </Card>
+            {runLogs.length ? (
+              <LiveLogBoard
+                logs={runLogs}
+                running={false}
+                title="运行日志"
+                description="这次重新登录的完整服务端日志。"
+                ariaLabel="重新登录日志"
+                statusIdleLabel="已结束"
+                onToast={(message) => notify(message)}
+              />
+            ) : null}
           </>
         )}
         <Toast message={toast} />
@@ -245,7 +268,7 @@ export function ReloginHistoryPage() {
       <AccountPageContext crumbs={[{ label: "重新登录", to: "/accounts/relogin" }, { label: "登录历史" }]} />
       <PageHeader
         title="登录历史"
-        description="重新登录报告保存在当前浏览器 IndexedDB，可随时查看、复制或删除。"
+        description="报告和运行日志保存在服务端数据库，任何浏览器登录后都能查看、复制或删除。"
         actions={
           <Button
             variant="outline"

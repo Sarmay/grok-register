@@ -193,7 +193,24 @@ export type Stats = {
 export type LogItem = {
   id: number;
   time: string;
+  /** 带日期和时区的完整时间，例如 2026-09-23 09:15:02+08:00 */
+  timestamp?: string;
   message: string;
+};
+
+export type TaskRunKind = "registration" | "relogin" | "sso_check";
+
+export type TaskRun = {
+  kind: TaskRunKind;
+  run_id: string;
+  started_at: number | null;
+  finished_at: number | null;
+  /** running | finished | stopped | failed | interrupted */
+  status: string;
+  summary: Record<string, any>;
+  log_count: number;
+  counts: { total: number; success: number; failure: number; cancelled?: number; skipped?: number };
+  active?: boolean;
 };
 
 export type AuthState = {
@@ -547,6 +564,32 @@ export const api = {
     request<{ ok: boolean; config: Record<string, any>; changed: string[] }>("/api/config", {
       method: "PUT",
       body: JSON.stringify({ config }),
+    }),
+  taskRuns: (params: { kind: TaskRunKind; q?: string; limit?: number; offset?: number }) => {
+    const sp = new URLSearchParams({ kind: params.kind });
+    if (params.q) sp.set("q", params.q);
+    if (params.limit) sp.set("limit", String(params.limit));
+    if (params.offset) sp.set("offset", String(params.offset));
+    return request<{ ok: boolean; items: TaskRun[]; total: number; active_run_id: string }>(
+      `/api/tasks/runs?${sp.toString()}`
+    );
+  },
+  taskRun: (kind: TaskRunKind, runId: string) =>
+    request<{ ok: boolean; run: TaskRun }>(`/api/tasks/runs/${kind}/${encodeURIComponent(runId)}`),
+  taskRunLogs: (kind: TaskRunKind, runId: string, afterSeq = 0, limit = 5000) =>
+    request<{ ok: boolean; logs: LogItem[]; total: number }>(
+      `/api/tasks/runs/${kind}/${encodeURIComponent(runId)}/logs?after_seq=${afterSeq}&limit=${limit}`
+    ),
+  deleteTaskRun: (kind: TaskRunKind, runId: string) =>
+    request<{ ok: boolean; deleted: boolean }>(`/api/tasks/runs/${kind}/${encodeURIComponent(runId)}/delete`, {
+      method: "POST",
+    }),
+  clearTaskRuns: (kind: TaskRunKind) =>
+    request<{ ok: boolean; deleted: number }>(`/api/tasks/runs/${kind}/clear`, { method: "POST" }),
+  importTaskRuns: (kind: TaskRunKind, entries: Array<Record<string, unknown>>) =>
+    request<{ ok: boolean; imported: number }>(`/api/tasks/runs/${kind}/import`, {
+      method: "POST",
+      body: JSON.stringify({ entries }),
     }),
   job: () => request<{ ok: boolean; job: JobStatus }>("/api/job"),
   logs: (afterId = 0, limit = 500) =>

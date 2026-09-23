@@ -339,6 +339,9 @@ DEFAULT_CONFIG = {
     "browser_traffic_savings_level": "standard",
     "close_browser_on_stop": False,
     "log_level": "info",
+    # 任务历史（注册批次 / 重新登录 / SSO 检查的日志与摘要）保留策略，0 表示不限制
+    "task_history_retention_days": 60,
+    "task_history_retention_count": 200,
     "register_count": 1,
     "register_workers": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -3240,7 +3243,7 @@ class RegistrationStopController:
 def registration_log(message):
     if not should_emit_log(message):
         return
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
     print(line, flush=True)
 

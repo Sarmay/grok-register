@@ -8,7 +8,6 @@ import { LiveLogBoard } from "@/components/LiveLogBoard";
 import { reloginSsoCheckLabel } from "@/components/ReloginReportDialog";
 import { Badge, Button, Card, EmptyState, Input, PageHeader, PaginationBar, Select, Toast } from "@/components/ui";
 import { api, type AccountRecord, type LogItem, type ReloginItem, type ReloginStatus } from "@/lib/api";
-import { appendReloginHistory } from "@/lib/reloginHistory";
 
 const RELOGIN_RESULT_PAGE_SIZE = 20;
 
@@ -246,7 +245,6 @@ export function ReloginPage() {
           return;
         }
         if (next?.run_id && recordedRun.current !== next.run_id) {
-          await appendReloginHistory(next);
           recordedRun.current = next.run_id;
           if (next.finished_at) void loadAccounts();
         }

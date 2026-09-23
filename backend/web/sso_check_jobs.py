@@ -2,13 +2,15 @@
 """批量 SSO 详细检查后台任务。"""
 from __future__ import annotations
 
+import collections
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from backend.web.account_exports import read_sso_token
+from backend.web.task_history import KIND_SSO_CHECK, TaskRunRecorder, now_iso, prune_history
 
 
 def inspect_sso_token(
@@ -120,6 +122,50 @@ class SsoCheckJobCoordinator:
         self._run_id = ""
         self._items: List[Dict[str, Any]] = []
         self._thread: Optional[threading.Thread] = None
+        self._logs: Deque[Dict[str, Any]] = collections.deque(maxlen=2000)
+        self._log_seq = 0
+        self._recorder: Optional[TaskRunRecorder] = None
+
+    @staticmethod
+    def _repository() -> Any:
+        try:
+            from backend.registration import engine as gr
+
+            return gr.get_registration_repository()
+        except Exception:
+            return None
+
+    def _append_log(self, message: str) -> None:
+        text = str(message or "")
+        if not text:
+            return
+        stamp = now_iso()
+        with self._lock:
+            self._log_seq += 1
+            entry = {"id": self._log_seq, "time": stamp[11:19], "timestamp": stamp, "message": text}
+            self._logs.append(entry)
+            recorder = self._recorder
+        if recorder is not None:
+            recorder.append(entry["id"], text, stamp)
+
+    def get_logs(self, after_id: int = 0, limit: int = 500) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 500), 2000))
+        threshold = max(0, int(after_id or 0))
+        with self._lock:
+            items = [dict(item) for item in self._logs if int(item["id"]) > threshold]
+        return items[-safe_limit:] if len(items) > safe_limit else items
+
+    def _history_summary(self) -> Dict[str, Any]:
+        summary = self.status()
+        summary.pop("running", None)
+        return summary
+
+    def _finish_history(self, status: str) -> None:
+        recorder = self._recorder
+        if recorder is None:
+            return
+        summary = self._history_summary()
+        recorder.finish(summary.get("finished_at"), status, summary)
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
@@ -230,6 +276,17 @@ class SsoCheckJobCoordinator:
             self._failed_count = failed_count
             self._run_id = uuid.uuid4().hex
             self._items = seed_items
+            self._logs.clear()
+            self._recorder = TaskRunRecorder(KIND_SSO_CHECK, self._run_id, self._repository)
+
+        prune_history(self._repository(), getattr(gr, "config", {}), KIND_SSO_CHECK)
+        self._recorder.begin(self._started_at, self._history_summary())
+        self._append_log(
+            f"[*] SSO 详细检查启动：共 {len(normalized_ids)} 个账号，可检查 {len(runnable)} 个"
+        )
+        for item in seed_items:
+            if item.get("status") == "failed":
+                self._append_log(f"[!] {item.get('email') or item.get('account_id')}: {item.get('error')}")
 
         job_index = {int(item["account_id"]): item for item in seed_items}
 
@@ -239,6 +296,7 @@ class SsoCheckJobCoordinator:
                     account_id = int(record.get("id") or 0)
                     email = str(record.get("email") or "").strip()
                     self._set(account_id=account_id, email=email, stage="检查账号风控")
+                    self._append_log(f"[*] 检查 {email or account_id}")
                     try:
                         outcome = self._run_record(record, store)
                     except Exception as exc:
@@ -247,6 +305,14 @@ class SsoCheckJobCoordinator:
                             "verdict": "error",
                             "error": str(exc) or exc.__class__.__name__,
                         }
+                    outcome_status = str(outcome.get("status") or "failed")
+                    if outcome_status == "failed":
+                        self._append_log(f"[!] {email or account_id}: 检查失败: {outcome.get('error') or '未知错误'}")
+                    else:
+                        label = {"clean": "正常", "flagged": "异常"}.get(outcome_status, "未知")
+                        self._append_log(
+                            f"[*] {email or account_id}: {label} botFlagSource={outcome.get('bot_flag_source')}"
+                        )
                     with self._lock:
                         item = job_index[account_id]
                         item.update(outcome)
@@ -277,6 +343,9 @@ class SsoCheckJobCoordinator:
                     self._error = (
                         f"{self._failed_count} 个账号检查失败" if self._failed_count else ""
                     )
+                    stage = self._stage
+                self._append_log(f"[*] {stage}")
+                self._finish_history("finished")
 
         self._thread = threading.Thread(
             target=runner,
@@ -298,6 +367,7 @@ class SsoCheckJobCoordinator:
                 self._stage = "SSO 检查启动失败"
                 self._error = str(exc)
                 self._finished_at = time.time()
+            self._finish_history("failed")
             raise
         return self.status()
 

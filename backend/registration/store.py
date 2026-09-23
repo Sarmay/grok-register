@@ -61,6 +61,11 @@ RESULT_COLUMNS = (
 
 SQLITE_IN_BATCH_SIZE = 900
 
+TASK_KIND_REGISTRATION = "registration"
+TASK_KIND_RELOGIN = "relogin"
+TASK_KIND_SSO_CHECK = "sso_check"
+TASK_KINDS = (TASK_KIND_REGISTRATION, TASK_KIND_RELOGIN, TASK_KIND_SSO_CHECK)
+
 
 class RegistrationRepository:
     def __init__(self, database_path: os.PathLike[str] | str):
@@ -298,7 +303,33 @@ class RegistrationRepository:
                 )
                 """
             )
-            conn.execute("PRAGMA user_version = 9")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS task_runs (
+                    kind TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    started_at REAL NOT NULL DEFAULT 0,
+                    finished_at REAL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    summary_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (kind, run_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_runs_started
+                    ON task_runs(kind, started_at DESC);
+                CREATE TABLE IF NOT EXISTS task_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    logged_at TEXT NOT NULL DEFAULT '',
+                    message TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_logs_run
+                    ON task_logs(kind, run_id, seq);
+                """
+            )
+            conn.execute("PRAGMA user_version = 10")
 
     def add_result(self, record: Dict[str, Any]) -> int:
         now = self.now_text()
@@ -1396,6 +1427,391 @@ class RegistrationRepository:
                     batch,
                 )
         return records
+
+    # ── 任务运行历史 ──
+
+    @staticmethod
+    def _task_kind(kind: str) -> str:
+        value = str(kind or "").strip().lower()
+        if value not in TASK_KINDS:
+            raise ValueError("kind 必须是 registration、relogin 或 sso_check")
+        return value
+
+    @staticmethod
+    def _local_text_to_epoch(text: Any) -> Optional[float]:
+        value = str(text or "").strip()
+        if not value:
+            return None
+        try:
+            parsed = _datetime.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+        return parsed.astimezone().timestamp()
+
+    def upsert_task_run(
+        self,
+        kind: str,
+        run_id: str,
+        *,
+        started_at: Optional[float] = None,
+        finished_at: Optional[float] = None,
+        status: str = "running",
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """登记或更新一次任务。started_at 传 None 时保留已有值。"""
+        kind = self._task_kind(kind)
+        key = str(run_id or "").strip()
+        if not key:
+            return
+        payload = json.dumps(summary or {}, ensure_ascii=False, default=str)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO task_runs (kind, run_id, started_at, finished_at, status, summary_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(kind, run_id) DO UPDATE SET
+                    started_at = CASE WHEN excluded.started_at > 0
+                                      THEN excluded.started_at ELSE task_runs.started_at END,
+                    finished_at = excluded.finished_at,
+                    status = excluded.status,
+                    summary_json = excluded.summary_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    kind,
+                    key,
+                    float(started_at or 0.0),
+                    finished_at,
+                    str(status or "running"),
+                    payload,
+                    self.now_text(),
+                ),
+            )
+
+    def mark_task_run_interrupted(self, kind: str, run_id: str, error: str = "") -> bool:
+        """服务重启后，把上次还标着 running 的任务改成 interrupted。"""
+        kind = self._task_kind(kind)
+        key = str(run_id or "").strip()
+        if not key:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT summary_json FROM task_runs WHERE kind = ? AND run_id = ? AND status = 'running'",
+                (kind, key),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                summary = json.loads(row["summary_json"] or "{}")
+            except ValueError:
+                summary = {}
+            if not isinstance(summary, dict):
+                summary = {}
+            if error and not summary.get("last_error"):
+                summary["last_error"] = str(error)
+            conn.execute(
+                """
+                UPDATE task_runs
+                SET status = 'interrupted', finished_at = COALESCE(finished_at, ?),
+                    summary_json = ?, updated_at = ?
+                WHERE kind = ? AND run_id = ?
+                """,
+                (
+                    _datetime.datetime.now().timestamp(),
+                    json.dumps(summary, ensure_ascii=False, default=str),
+                    self.now_text(),
+                    kind,
+                    key,
+                ),
+            )
+        return True
+
+    def append_task_logs(self, kind: str, run_id: str, rows: Iterable[Tuple[int, str, str]]) -> int:
+        kind = self._task_kind(kind)
+        key = str(run_id or "").strip()
+        normalized = [
+            (kind, key, int(seq), str(logged_at or ""), str(message or ""))
+            for seq, logged_at, message in rows
+        ]
+        if not key or not normalized:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO task_logs (kind, run_id, seq, logged_at, message) VALUES (?, ?, ?, ?, ?)",
+                normalized,
+            )
+        return len(normalized)
+
+    def get_task_logs(
+        self, kind: str, run_id: str, *, after_seq: int = 0, limit: int = 2000
+    ) -> List[Dict[str, Any]]:
+        kind = self._task_kind(kind)
+        safe_limit = max(1, min(int(limit or 2000), 5000))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT seq, logged_at, message FROM task_logs
+                WHERE kind = ? AND run_id = ? AND seq > ?
+                ORDER BY seq ASC LIMIT ?
+                """,
+                (kind, str(run_id or ""), max(int(after_seq or 0), 0), safe_limit),
+            ).fetchall()
+        items = []
+        for row in rows:
+            stamp = str(row["logged_at"] or "")
+            items.append(
+                {
+                    "id": int(row["seq"]),
+                    "time": stamp[11:19] if len(stamp) >= 19 else stamp,
+                    "timestamp": stamp,
+                    "message": str(row["message"] or ""),
+                }
+            )
+        return items
+
+    def count_task_logs(self, kind: str, run_id: str) -> int:
+        kind = self._task_kind(kind)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM task_logs WHERE kind = ? AND run_id = ?",
+                (kind, str(run_id or "")),
+            ).fetchone()
+        return int(row["total"] or 0)
+
+    @staticmethod
+    def _registration_batches(conn: sqlite3.Connection, run_id: str = "") -> Dict[str, Dict[str, Any]]:
+        """按批次汇总账号结果。旧版本运行没有 task_runs 记录，也靠这里出现在历史列表。"""
+        where = "WHERE batch_id <> ''"
+        params: List[Any] = []
+        if run_id:
+            where += " AND batch_id = ?"
+            params.append(run_id)
+        rows = conn.execute(
+            f"""
+            SELECT batch_id,
+                   MIN(started_at) AS first_started,
+                   MAX(finished_at) AS last_finished,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success,
+                   SUM(CASE WHEN status = 'failure' THEN 1 ELSE 0 END) AS failure,
+                   SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                   SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
+                   GROUP_CONCAT(email, ' ') AS emails
+            FROM registration_results
+            {where}
+            GROUP BY batch_id
+            """,
+            params,
+        ).fetchall()
+        return {str(row["batch_id"]): dict(row) for row in rows}
+
+    def _task_run_item(
+        self,
+        kind: str,
+        run_id: str,
+        run_row: Optional[Dict[str, Any]],
+        batch: Optional[Dict[str, Any]],
+        log_count: int,
+    ) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {}
+        if run_row:
+            try:
+                loaded = json.loads(run_row.get("summary_json") or "{}")
+                summary = loaded if isinstance(loaded, dict) else {}
+            except ValueError:
+                summary = {}
+        started = float(run_row["started_at"]) if run_row and run_row.get("started_at") else None
+        finished = run_row.get("finished_at") if run_row else None
+        status = str(run_row.get("status") or "finished") if run_row else "finished"
+        counts = {
+            "total": int(summary.get("total_count") or summary.get("target_count") or 0),
+            "success": int(summary.get("success_count") or summary.get("clean_count") or 0),
+            "failure": int(summary.get("failed_count") or summary.get("failure_count") or 0),
+            "cancelled": 0,
+            "skipped": 0,
+        }
+        emails: List[str] = []
+        if batch:
+            counts = {name: int(batch.get(name) or 0) for name in counts}
+            if not started:
+                started = self._local_text_to_epoch(batch.get("first_started"))
+            if not finished and status != "running":
+                finished = self._local_text_to_epoch(batch.get("last_finished"))
+            emails = str(batch.get("emails") or "").split()
+        else:
+            items = summary.get("items")
+            if isinstance(items, list):
+                emails = [
+                    str(item.get("email") or "")
+                    for item in items
+                    if isinstance(item, dict) and item.get("email")
+                ]
+        return {
+            "kind": kind,
+            "run_id": run_id,
+            "started_at": started,
+            "finished_at": float(finished) if finished else None,
+            "status": status,
+            "summary": summary,
+            "log_count": int(log_count or 0),
+            "counts": counts,
+            "search_text": " ".join([run_id, *emails]).lower(),
+        }
+
+    def list_task_runs(
+        self, kind: str, *, keyword: str = "", limit: int = 20, offset: int = 0
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        kind = self._task_kind(kind)
+        with self._connect() as conn:
+            runs = {
+                str(row["run_id"]): dict(row)
+                for row in conn.execute("SELECT * FROM task_runs WHERE kind = ?", (kind,)).fetchall()
+            }
+            log_counts = {
+                str(row["run_id"]): int(row["total"] or 0)
+                for row in conn.execute(
+                    "SELECT run_id, COUNT(*) AS total FROM task_logs WHERE kind = ? GROUP BY run_id",
+                    (kind,),
+                ).fetchall()
+            }
+            batches = self._registration_batches(conn) if kind == TASK_KIND_REGISTRATION else {}
+        needle = str(keyword or "").strip().lower()
+        items: List[Dict[str, Any]] = []
+        for run_id in set(runs) | set(batches):
+            item = self._task_run_item(kind, run_id, runs.get(run_id), batches.get(run_id), log_counts.get(run_id, 0))
+            if needle and needle not in item["search_text"]:
+                continue
+            item.pop("search_text", None)
+            items.append(item)
+        items.sort(key=lambda entry: (entry["started_at"] or 0.0, entry["run_id"]), reverse=True)
+        total = len(items)
+        safe_limit = max(1, min(int(limit or 20), 500))
+        safe_offset = max(0, int(offset or 0))
+        return items[safe_offset : safe_offset + safe_limit], total
+
+    def get_task_run(self, kind: str, run_id: str) -> Optional[Dict[str, Any]]:
+        kind = self._task_kind(kind)
+        key = str(run_id or "").strip()
+        if not key:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_runs WHERE kind = ? AND run_id = ?", (kind, key)
+            ).fetchone()
+            batch = (
+                self._registration_batches(conn, key).get(key)
+                if kind == TASK_KIND_REGISTRATION
+                else None
+            )
+            log_count = conn.execute(
+                "SELECT COUNT(*) AS total FROM task_logs WHERE kind = ? AND run_id = ?",
+                (kind, key),
+            ).fetchone()["total"]
+        if row is None and batch is None:
+            return None
+        item = self._task_run_item(kind, key, dict(row) if row else None, batch, int(log_count or 0))
+        item.pop("search_text", None)
+        return item
+
+    def delete_task_run(self, kind: str, run_id: str) -> bool:
+        kind = self._task_kind(kind)
+        key = str(run_id or "").strip()
+        if not key:
+            return False
+        with self._connect() as conn:
+            runs = conn.execute(
+                "DELETE FROM task_runs WHERE kind = ? AND run_id = ?", (kind, key)
+            ).rowcount
+            logs = conn.execute(
+                "DELETE FROM task_logs WHERE kind = ? AND run_id = ?", (kind, key)
+            ).rowcount
+        return bool(runs or logs)
+
+    def clear_task_runs(self, kind: str, *, keep_run_id: str = "") -> int:
+        kind = self._task_kind(kind)
+        keep = str(keep_run_id or "").strip()
+        with self._connect() as conn:
+            runs = conn.execute(
+                "DELETE FROM task_runs WHERE kind = ? AND run_id <> ?", (kind, keep)
+            ).rowcount
+            conn.execute("DELETE FROM task_logs WHERE kind = ? AND run_id <> ?", (kind, keep))
+        return int(runs or 0)
+
+    def prune_task_runs(self, kind: str, *, keep_days: int = 60, keep_count: int = 200) -> int:
+        """删掉过旧或超出条数的已结束任务及其日志。0 表示该维度不限制。"""
+        kind = self._task_kind(kind)
+        cutoff = (
+            _datetime.datetime.now().timestamp() - max(int(keep_days), 0) * 86400
+            if keep_days and int(keep_days) > 0
+            else None
+        )
+        limit = int(keep_count or 0)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_id, started_at FROM task_runs
+                WHERE kind = ? AND status <> 'running'
+                ORDER BY started_at DESC, run_id DESC
+                """,
+                (kind,),
+            ).fetchall()
+            doomed = [
+                str(row["run_id"])
+                for index, row in enumerate(rows)
+                if (limit and index >= limit)
+                or (cutoff is not None and float(row["started_at"] or 0.0) < cutoff)
+            ]
+            for start in range(0, len(doomed), SQLITE_IN_BATCH_SIZE):
+                chunk = doomed[start : start + SQLITE_IN_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in chunk)
+                conn.execute(
+                    f"DELETE FROM task_runs WHERE kind = ? AND run_id IN ({placeholders})",
+                    [kind, *chunk],
+                )
+                conn.execute(
+                    f"DELETE FROM task_logs WHERE kind = ? AND run_id IN ({placeholders})",
+                    [kind, *chunk],
+                )
+        return len(doomed)
+
+    def import_task_runs(self, kind: str, entries: Iterable[Dict[str, Any]]) -> int:
+        """导入旧版浏览器本地历史；已有的服务端记录不会被覆盖。"""
+        kind = self._task_kind(kind)
+        imported = 0
+        now_text = self.now_text()
+        with self._connect() as conn:
+            for entry in entries or []:
+                if not isinstance(entry, dict):
+                    continue
+                run_id = str(entry.get("run_id") or "").strip()
+                if not run_id:
+                    continue
+                summary = entry.get("summary")
+                if not isinstance(summary, dict):
+                    summary = {
+                        key: value
+                        for key, value in entry.items()
+                        if key not in {"run_id", "started_at", "finished_at"}
+                    }
+                started = float(entry.get("started_at") or entry.get("finished_at") or 0.0)
+                finished = entry.get("finished_at")
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO task_runs
+                        (kind, run_id, started_at, finished_at, status, summary_json, updated_at)
+                    VALUES (?, ?, ?, ?, 'finished', ?, ?)
+                    """,
+                    (
+                        kind,
+                        run_id,
+                        started,
+                        float(finished) if finished else None,
+                        json.dumps(summary, ensure_ascii=False, default=str),
+                        now_text,
+                    ),
+                )
+                imported += int(cursor.rowcount or 0)
+        return imported
 
     # ── MailNest 订单池 ──
 

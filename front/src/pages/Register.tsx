@@ -9,6 +9,7 @@ import {
   Clock3,
   Copy,
   ExternalLink,
+  History,
   Image as ImageIcon,
   Loader2,
   MoreHorizontal,
@@ -659,6 +660,13 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
             >
               <Play className="h-3.5 w-3.5" />
               新建任务
+            </Link>
+            <Link
+              to={job?.batch_id ? `/registration/history/${encodeURIComponent(job.batch_id)}` : "/registration/history"}
+              className={cn(buttonVariants({ variant: "outline", size: "sm" }), "inline-flex items-center gap-1.5")}
+            >
+              <History className="h-3.5 w-3.5" />
+              任务历史
             </Link>
             <Link to="/accounts" className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "inline-flex")}>
               账号结果

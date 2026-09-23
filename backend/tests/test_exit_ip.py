@@ -64,7 +64,7 @@ class FlaggedExitIpStoreTests(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type = 'table'"
                     )
                 }
-            self.assertEqual(version, 9)
+            self.assertEqual(version, 10)
             self.assertIn("flagged_exit_ips", tables)
 
     def test_lists_and_deletes_flagged_exit_ips(self):

@@ -8,7 +8,7 @@ export const HighlightedLogLine = memo(function HighlightedLogLine({
   activeOccurrence,
   toneClassName,
 }: {
-  item: { id: number; time: string; message: string };
+  item: { id: number; time: string; timestamp?: string; message: string };
   query: string;
   activeOccurrence: number;
   toneClassName?: string;
@@ -47,7 +47,7 @@ export const HighlightedLogLine = memo(function HighlightedLogLine({
         </span>
       ) : (
         <>
-          <span className="text-sky-600">[{item.time}]</span>{" "}
+          <span className="text-sky-600" title={item.timestamp || undefined}>[{item.time}]</span>{" "}
           <span className={cn("whitespace-pre-wrap break-all", toneClassName)}>{item.message}</span>
         </>
       )}

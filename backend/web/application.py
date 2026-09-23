@@ -29,7 +29,9 @@ from .browser_view import get_browser_view
 from .jobs import job_coordinator
 from .relogin_jobs import relogin_coordinator
 from .sso_check_jobs import sso_check_coordinator
+from . import task_history
 from .update_check import ReleaseUpdateService
+from backend.registration import store as store_module
 from backend.integrations.proxy import validate_http_proxy_url
 from backend.integrations import grokiq
 from backend.shared.paths import DATA_ROOT, PROJECT_ROOT, STATIC_ROOT
@@ -165,6 +167,10 @@ class LoginBody(BaseModel):
     username: str = ""
     password: str = ""
     confirm_password: str = ""
+
+
+class TaskRunImportBody(BaseModel):
+    entries: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class FlaggedExitIpBody(BaseModel):
@@ -1492,6 +1498,96 @@ def create_app() -> FastAPI:
             "side_lines": side_lines,
             "file_errors": file_errors[:20],
         }
+
+    # ── 任务历史 ──
+
+    def _task_kind_or_400(kind: str) -> str:
+        try:
+            return store_module.RegistrationRepository._task_kind(kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _active_task_run_id(kind: str) -> str:
+        if kind == task_history.KIND_REGISTRATION:
+            status = job_coordinator.status()
+            return str(status.get("batch_id") or "") if status.get("running") else ""
+        if kind == task_history.KIND_RELOGIN:
+            status = relogin_coordinator.status()
+        else:
+            status = sso_check_coordinator.status()
+        return str(status.get("run_id") or "") if status.get("running") else ""
+
+    @app.get("/api/tasks/runs")
+    def api_task_runs(
+        kind: str = Query(...),
+        q: str = Query(""),
+        limit: int = Query(20, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> Dict[str, Any]:
+        kind_norm = _task_kind_or_400(kind)
+        store = _gr().get_registration_repository()
+        items, total = store.list_task_runs(
+            kind_norm, keyword=str(q or "").strip(), limit=limit, offset=offset
+        )
+        return {
+            "ok": True,
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "active_run_id": _active_task_run_id(kind_norm),
+        }
+
+    @app.post("/api/tasks/runs/{kind}/clear")
+    def api_task_runs_clear(kind: str) -> Dict[str, Any]:
+        kind_norm = _task_kind_or_400(kind)
+        store = _gr().get_registration_repository()
+        deleted = store.clear_task_runs(kind_norm, keep_run_id=_active_task_run_id(kind_norm))
+        return {"ok": True, "deleted": deleted}
+
+    @app.post("/api/tasks/runs/{kind}/import")
+    def api_task_runs_import(kind: str, body: TaskRunImportBody) -> Dict[str, Any]:
+        """把旧版本存在浏览器里的历史一次性搬到服务端。"""
+        kind_norm = _task_kind_or_400(kind)
+        store = _gr().get_registration_repository()
+        imported = store.import_task_runs(kind_norm, body.entries[:500])
+        return {"ok": True, "imported": imported}
+
+    @app.get("/api/tasks/runs/{kind}/{run_id}")
+    def api_task_run(kind: str, run_id: str) -> Dict[str, Any]:
+        kind_norm = _task_kind_or_400(kind)
+        store = _gr().get_registration_repository()
+        run = store.get_task_run(kind_norm, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="任务记录不存在")
+        run["active"] = _active_task_run_id(kind_norm) == run["run_id"]
+        return {"ok": True, "run": run}
+
+    @app.get("/api/tasks/runs/{kind}/{run_id}/logs")
+    def api_task_run_logs(
+        kind: str,
+        run_id: str,
+        after_seq: int = Query(0, ge=0),
+        limit: int = Query(2000, ge=1, le=5000),
+    ) -> Dict[str, Any]:
+        kind_norm = _task_kind_or_400(kind)
+        store = _gr().get_registration_repository()
+        return {
+            "ok": True,
+            "logs": store.get_task_logs(kind_norm, run_id, after_seq=after_seq, limit=limit),
+            "total": store.count_task_logs(kind_norm, run_id),
+        }
+
+    @app.post("/api/tasks/runs/{kind}/{run_id}/delete")
+    def api_task_run_delete(kind: str, run_id: str) -> Dict[str, Any]:
+        kind_norm = _task_kind_or_400(kind)
+        if _active_task_run_id(kind_norm) == str(run_id or ""):
+            raise HTTPException(status_code=409, detail="任务还在运行，结束后再删除")
+        store = _gr().get_registration_repository()
+        deleted = store.delete_task_run(kind_norm, run_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="任务记录不存在")
+        return {"ok": True, "deleted": True}
 
     @app.get("/api/flagged-exit-ips")
     def api_flagged_exit_ips() -> Dict[str, Any]:
