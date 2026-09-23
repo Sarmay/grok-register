@@ -795,7 +795,156 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
         </CardContent>
       </Card>
 
-      <BrowserStage workers={Number(job?.workers ?? workers) || 1} />
+      {/* 浏览器画面 + 实时日志：宽屏并排，同屏对照；窄屏上下堆叠 */}
+      <div className="grid gap-5 sm:gap-6 xl:grid-cols-2 xl:items-start">
+        <BrowserStage workers={Number(job?.workers ?? workers) || 1} className="xl:sticky xl:top-16" />
+
+        <Card className="min-w-0 overflow-hidden">
+          <CardHeader className="space-y-3 border-b border-slate-100">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <CardTitle className="flex items-center gap-2">
+                  <TerminalSquare className="h-4 w-4 text-slate-600" />
+                  实时日志
+                </CardTitle>
+                <CardDescription>
+                  {job?.last_error ? `最近错误：${job.last_error}` : "按时间顺序显示浏览器和注册流程日志。"}
+                </CardDescription>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={() => void copyVisibleLogs()}>
+                  <Copy className="h-3.5 w-3.5" />
+                  复制
+                </Button>
+                <Button size="sm" variant="outline" onClick={clearLogView}>
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  清空视图
+                </Button>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2 lg:flex-row lg:items-center xl:flex-col xl:items-stretch 2xl:flex-row 2xl:items-center">
+              <LogSearchField
+                query={logQuery}
+                matchCount={matches.length}
+                activeIndex={safeMatchIndex}
+                onQueryChange={setLogQuery}
+                onPrev={() => goToMatch(safeMatchIndex - 1)}
+                onNext={() => goToMatch(safeMatchIndex + 1)}
+              />
+              <div className="flex flex-wrap items-center gap-1.5">
+                {levelFilters.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => setLogLevel(item.id)}
+                    className={cn(
+                      "rounded-full px-2.5 py-1 text-xs font-medium transition",
+                      logLevel === item.id ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                    )}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <label className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600">
+                <Switch
+                  checked={autoScroll}
+                  onCheckedChange={(checked) => {
+                    setAutoScroll(checked);
+                    if (checked) {
+                      userPinnedRef.current = false;
+                      requestAnimationFrame(jumpToBottom);
+                    }
+                  }}
+                  label="自动滚动"
+                />
+                <span>自动滚动</span>
+              </label>
+            </div>
+          </CardHeader>
+
+          <CardContent className="relative p-3 sm:p-5">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+              <span className="flex items-center gap-2">
+                <span className={cn("h-2 w-2 rounded-full", job?.running ? "animate-pulse bg-amber-500" : "bg-emerald-500")} />
+                {job?.running ? "日志持续同步中" : "等待新任务"}
+              </span>
+              <span className="tabular-nums">
+                完成 {progressCompleted} · 显示 {renderedLogs.length} / {levelLogs.length} · 缓冲 {logs.length}
+                {searching ? ` · 匹配 ${matches.length ? `${safeMatchIndex + 1}/${matches.length}` : 0}` : ""}
+              </span>
+            </div>
+
+            <div className="sr-only" aria-live="polite" aria-atomic="true">
+              {renderedLogs.length ? `最新日志：${renderedLogs[renderedLogs.length - 1].message}` : ""}
+            </div>
+
+            <div
+              ref={logRef}
+              onScroll={onLogScroll}
+              role="log"
+              aria-label="实时注册日志"
+              aria-live="off"
+              className="font-mono-log h-[50dvh] min-h-[360px] max-h-[640px] overflow-auto rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs leading-6 sm:h-[540px] sm:p-4"
+            >
+              {levelLogs.length === 0 ? (
+                <div className="flex h-full min-h-40 flex-col items-center justify-center gap-2 text-center text-slate-500">
+                  <div>
+                    {logs.length === 0
+                      ? job?.running
+                        ? logViewCleared
+                          ? "视图已清空，正在等待下一条实时日志…"
+                          : "任务运行中，正在等待实时日志…"
+                        : "等待日志…启动任务后会在这里实时输出。"
+                      : "没有符合筛选条件的日志。"}
+                  </div>
+                  {!job?.running && logs.length === 0 ? (
+                    <Link to="/registration/new" className="text-sm text-sky-600 hover:text-sky-700">
+                      去新建注册任务 →
+                    </Link>
+                  ) : null}
+                </div>
+              ) : (
+                <>
+                  {hiddenFilteredLogCount > 0 ? (
+                    <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 font-sans text-xs text-slate-500">
+                      <span>为保持流畅，前面 {hiddenFilteredLogCount} 行暂未生成页面节点。</span>
+                      <button
+                        type="button"
+                        onClick={revealOlderLogs}
+                        className="font-medium text-sky-600 hover:text-sky-700"
+                      >
+                        再显示 {Math.min(LOG_RENDER_STEP, hiddenFilteredLogCount)} 行
+                      </button>
+                    </div>
+                  ) : null}
+                  {renderedLogs.map((item) => (
+                    <HighlightedLogLine
+                      key={item.id}
+                      item={item}
+                      query={query}
+                      activeOccurrence={currentMatch?.logId === item.id ? currentMatch.occurrence : -1}
+                      toneClassName={logToneClass[item.tone]}
+                    />
+                  ))}
+                </>
+              )}
+            </div>
+
+            {showJumpBottom ? (
+              <button
+                type="button"
+                onClick={jumpToBottom}
+                className="absolute bottom-8 right-8 inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-md hover:bg-slate-50"
+              >
+                <ArrowDownToLine className="h-3.5 w-3.5" />
+                回到底部
+              </button>
+            ) : null}
+          </CardContent>
+        </Card>
+      </div>
 
       {/* 本次结果：默认折叠，标题显示成功/失败 */}
       {(() => {
@@ -968,153 +1117,6 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
           </Card>
         );
       })()}
-
-      {/* 日志：全宽浅底 */}
-      <Card className="min-w-0 overflow-hidden">
-        <CardHeader className="space-y-3 border-b border-slate-100">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <CardTitle className="flex items-center gap-2">
-                <TerminalSquare className="h-4 w-4 text-slate-600" />
-                实时日志
-              </CardTitle>
-              <CardDescription>
-                {job?.last_error ? `最近错误：${job.last_error}` : "按时间顺序显示浏览器和注册流程日志。"}
-              </CardDescription>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button size="sm" variant="outline" onClick={() => void copyVisibleLogs()}>
-                <Copy className="h-3.5 w-3.5" />
-                复制
-              </Button>
-              <Button size="sm" variant="outline" onClick={clearLogView}>
-                <RotateCcw className="h-3.5 w-3.5" />
-                清空视图
-              </Button>
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
-            <LogSearchField
-              query={logQuery}
-              matchCount={matches.length}
-              activeIndex={safeMatchIndex}
-              onQueryChange={setLogQuery}
-              onPrev={() => goToMatch(safeMatchIndex - 1)}
-              onNext={() => goToMatch(safeMatchIndex + 1)}
-            />
-            <div className="flex flex-wrap items-center gap-1.5">
-              {levelFilters.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setLogLevel(item.id)}
-                  className={cn(
-                    "rounded-full px-2.5 py-1 text-xs font-medium transition",
-                    logLevel === item.id ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"
-                  )}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </div>
-            <label className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600">
-              <Switch
-                checked={autoScroll}
-                onCheckedChange={(checked) => {
-                  setAutoScroll(checked);
-                  if (checked) {
-                    userPinnedRef.current = false;
-                    requestAnimationFrame(jumpToBottom);
-                  }
-                }}
-                label="自动滚动"
-              />
-              <span>自动滚动</span>
-            </label>
-          </div>
-        </CardHeader>
-
-        <CardContent className="relative p-3 sm:p-5">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
-            <span className="flex items-center gap-2">
-              <span className={cn("h-2 w-2 rounded-full", job?.running ? "animate-pulse bg-amber-500" : "bg-emerald-500")} />
-              {job?.running ? "日志持续同步中" : "等待新任务"}
-            </span>
-            <span className="tabular-nums">
-              完成 {progressCompleted} · 显示 {renderedLogs.length} / {levelLogs.length} · 缓冲 {logs.length}
-              {searching ? ` · 匹配 ${matches.length ? `${safeMatchIndex + 1}/${matches.length}` : 0}` : ""}
-            </span>
-          </div>
-
-          <div className="sr-only" aria-live="polite" aria-atomic="true">
-            {renderedLogs.length ? `最新日志：${renderedLogs[renderedLogs.length - 1].message}` : ""}
-          </div>
-
-          <div
-            ref={logRef}
-            onScroll={onLogScroll}
-            role="log"
-            aria-label="实时注册日志"
-            aria-live="off"
-            className="font-mono-log h-[50dvh] min-h-[360px] max-h-[640px] overflow-auto rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs leading-6 sm:h-[540px] sm:p-4"
-          >
-            {levelLogs.length === 0 ? (
-              <div className="flex h-full min-h-40 flex-col items-center justify-center gap-2 text-center text-slate-500">
-                <div>
-                  {logs.length === 0
-                    ? job?.running
-                      ? logViewCleared
-                        ? "视图已清空，正在等待下一条实时日志…"
-                        : "任务运行中，正在等待实时日志…"
-                      : "等待日志…启动任务后会在这里实时输出。"
-                    : "没有符合筛选条件的日志。"}
-                </div>
-                {!job?.running && logs.length === 0 ? (
-                  <Link to="/registration/new" className="text-sm text-sky-600 hover:text-sky-700">
-                    去新建注册任务 →
-                  </Link>
-                ) : null}
-              </div>
-            ) : (
-              <>
-                {hiddenFilteredLogCount > 0 ? (
-                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 font-sans text-xs text-slate-500">
-                    <span>为保持流畅，前面 {hiddenFilteredLogCount} 行暂未生成页面节点。</span>
-                    <button
-                      type="button"
-                      onClick={revealOlderLogs}
-                      className="font-medium text-sky-600 hover:text-sky-700"
-                    >
-                      再显示 {Math.min(LOG_RENDER_STEP, hiddenFilteredLogCount)} 行
-                    </button>
-                  </div>
-                ) : null}
-                {renderedLogs.map((item) => (
-                  <HighlightedLogLine
-                    key={item.id}
-                    item={item}
-                    query={query}
-                    activeOccurrence={currentMatch?.logId === item.id ? currentMatch.occurrence : -1}
-                    toneClassName={logToneClass[item.tone]}
-                  />
-                ))}
-              </>
-            )}
-          </div>
-
-          {showJumpBottom ? (
-            <button
-              type="button"
-              onClick={jumpToBottom}
-              className="absolute bottom-8 right-8 inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-md hover:bg-slate-50"
-            >
-              <ArrowDownToLine className="h-3.5 w-3.5" />
-              回到底部
-            </button>
-          ) : null}
-        </CardContent>
-      </Card>
 
       {/* 更多操作：右侧抽屉 */}
       {opsOpen ? (

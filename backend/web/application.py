@@ -1542,7 +1542,9 @@ def create_app() -> FastAPI:
     def api_task_runs_clear(kind: str) -> Dict[str, Any]:
         kind_norm = _task_kind_or_400(kind)
         store = _gr().get_registration_repository()
-        deleted = store.clear_task_runs(kind_norm, keep_run_id=_active_task_run_id(kind_norm))
+        active_run_id = _active_task_run_id(kind_norm)
+        deleted = store.clear_task_runs(kind_norm, keep_run_id=active_run_id)
+        task_history.clear_log_files(kind_norm, keep_run_id=active_run_id)
         return {"ok": True, "deleted": deleted}
 
     @app.post("/api/tasks/runs/{kind}/import")
@@ -1585,6 +1587,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail="任务还在运行，结束后再删除")
         store = _gr().get_registration_repository()
         deleted = store.delete_task_run(kind_norm, run_id)
+        task_history.delete_log_file(kind_norm, run_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="任务记录不存在")
         return {"ok": True, "deleted": True}

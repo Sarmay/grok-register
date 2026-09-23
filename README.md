@@ -247,6 +247,8 @@ Windows 启动：
 | `task_history_retention_days` | 任务历史（注册批次 / 重新登录 / SSO 检查的日志与摘要）保留天数，默认 `60`，`0` 表示不按时间清理 |
 | `task_history_retention_count` | 每类任务最多保留的条数，默认 `200`，`0` 表示不限制；清理在每次任务启动时执行 |
 
+每个任务的日志除了写入任务历史，还会逐行实时追加到 `logs/tasks/<类型>-<批次号>.log`（类型为 `registration`、`relogin`、`sso_check`），可以直接 `tail -f` 查看正在运行的任务。这些文件与任务历史使用同一套保留策略，在任务历史页删除或清空记录时也会一起删除。
+
 GrokIQ 检测完成后会发送回调通知 `POST /api/integrations/grokiq/notify`（请求头 `x-grokiq-token`，类似支付异步通知）。账号详情会显示是否降智，注册机不会据此自动删除账号。
 
 统一 Compose 中，`GROKIQ_REGISTER_PROBE_STABILIZATION_SECONDS` 控制 GrokIQ 收到新账号事件后等待多久再创建首次探针，默认 `15` 秒，设为 `0` 可关闭等待。
@@ -265,6 +267,7 @@ data/
 └── cloakbrowser-cache/           # CloakBrowser 首次使用后下载的 Chromium
 
 logs/                             # 运行日志
+└── tasks/                        # 每个任务一份实时日志
 outlookemail-data/                # 可选 OutlookEmail 数据
 ```
 

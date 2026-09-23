@@ -12,7 +12,7 @@ import secrets
 import string
 import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, NoReturn
 
 from playwright._impl._errors import TargetClosedError as PageDisconnectedError
 
@@ -1688,29 +1688,15 @@ def _turnstile_widget_problem() -> str:
     return ""
 
 
-def _reject_turnstile_or_refresh(
-    already_refreshed: bool,
-    exc: BaseException,
-    log_callback=None,
-    cancel_callback=None,
-) -> bool:
-    """失效组件先刷新重填一次。已经刷新过则要求换浏览器出口。"""
-    if already_refreshed:
-        err = _AccountRetryNeeded("Turnstile 刷新后仍失败，重启浏览器更换出口后重试")
-        setattr(err, "single_retry", True)
-        raise err from exc
-    if log_callback:
-        log_callback(f"[*] Turnstile 组件失效（{exc}），刷新资料页后重填")
-    try:
-        page.reload()
-    except Exception as reload_exc:
-        err = _AccountRetryNeeded(
-            f"Turnstile 组件失效且刷新资料页失败，重启浏览器更换出口后重试: {reload_exc}"
-        )
-        setattr(err, "single_retry", True)
-        raise err from reload_exc
-    sleep_with_cancel(0.6, cancel_callback)
-    return True
+def _reject_turnstile(exc: BaseException) -> NoReturn:
+    """资料页 Turnstile 失效后直接换浏览器出口重试。
+
+    刷新资料页只会回到注册首页，要从选邮箱重新走，不如直接重启浏览器更换出口；
+    MailNest 已扣费的邮箱会进入复用队列，下一轮继续使用。
+    """
+    err = _AccountRetryNeeded(f"Turnstile 组件失效（{exc}），重启浏览器更换出口后重试")
+    setattr(err, "single_retry", True)
+    raise err from exc
 
 
 def _try_sync_turnstile(
@@ -1979,28 +1965,8 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     last_cf_log_at = 0.0
     last_logged_token_len = None
     last_form_diag_at = 0.0
-    profile_refreshed = False
-    profile_refreshed_at = 0.0
 
-    def _refresh_rejected_turnstile(exc):
-        nonlocal profile_refreshed, profile_refreshed_at, form_filled_once, wait_cf_since
-        nonlocal last_cf_retry_at, last_logged_token_len, deadline
-        profile_refreshed = _reject_turnstile_or_refresh(
-            profile_refreshed,
-            exc,
-            log_callback=log_callback,
-            cancel_callback=cancel_callback,
-        )
-        form_filled_once = False
-        wait_cf_since = None
-        last_cf_retry_at = 0.0
-        last_logged_token_len = None
-        profile_refreshed_at = time.time()
-        deadline = max(deadline, time.time() + 45)
-
-    def _turnstile_needs_refresh(now):
-        if profile_refreshed and now - profile_refreshed_at < 2.0:
-            return False
+    def _turnstile_rejected(now):
         problem = _turnstile_widget_problem()
         if problem == "failed":
             return True
@@ -2125,9 +2091,8 @@ return 'filled-no-submit';
                     wait_cf_since = now
                     # 首次仅短停，尽快进入主动复用节奏（原 1–3s 随机空等已去掉）
                     sleep_with_cancel(0.4, cancel_callback)
-                if _turnstile_needs_refresh(now):
-                    _refresh_rejected_turnstile(TurnstileWidgetRejected("资料页 Turnstile 失效"))
-                    continue
+                if _turnstile_rejected(now):
+                    _reject_turnstile(TurnstileWidgetRejected("资料页 Turnstile 失效"))
                 if _should_retry_cf(wait_cf_since, last_cf_retry_at, now):
                     try:
                         synced = _try_sync_turnstile(
@@ -2137,8 +2102,7 @@ return 'filled-no-submit';
                             max_unsolved_clicks=2,
                         )
                     except TurnstileWidgetRejected as exc:
-                        _refresh_rejected_turnstile(exc)
-                        continue
+                        _reject_turnstile(exc)
                     last_cf_retry_at = time.time()
                     if synced:
                         # Turnstile 已通过并回填，跳过下一轮 CF 检查直接提交
@@ -2235,9 +2199,8 @@ return 'ready-to-submit';
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now
-            if _turnstile_needs_refresh(now):
-                _refresh_rejected_turnstile(TurnstileWidgetRejected("资料页 Turnstile 失效"))
-                continue
+            if _turnstile_rejected(now):
+                _reject_turnstile(TurnstileWidgetRejected("资料页 Turnstile 失效"))
             if _should_retry_cf(wait_cf_since, last_cf_retry_at, now):
                 try:
                     synced = _try_sync_turnstile(
@@ -2247,8 +2210,7 @@ return 'ready-to-submit';
                         max_unsolved_clicks=2,
                     )
                 except TurnstileWidgetRejected as exc:
-                    _refresh_rejected_turnstile(exc)
-                    continue
+                    _reject_turnstile(exc)
                 last_cf_retry_at = time.time()
                 if synced:
                     # Turnstile 已通过并回填，跳过下一轮 CF 检查直接提交
@@ -2300,10 +2262,6 @@ btn.focus(); btn.click(); return 'submitted';
 
         sleep_with_cancel(0.5, cancel_callback)
 
-    if profile_refreshed:
-        err = _AccountRetryNeeded("Turnstile 刷新后资料页仍未提交，重启浏览器更换出口后重试")
-        setattr(err, "single_retry", True)
-        raise err
     raise Exception("最终注册页资料填写失败")
 
 

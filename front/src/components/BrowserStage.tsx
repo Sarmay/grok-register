@@ -4,7 +4,7 @@ import { api, type BrowserViewStatus } from "@/lib/api";
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
-export function BrowserStage({ workers = 1 }: { workers?: number }) {
+export function BrowserStage({ workers = 1, className }: { workers?: number; className?: string }) {
   const [status, setStatus] = useState<BrowserViewStatus | null>(null);
   const [src, setSrc] = useState("");
   const [expanded, setExpanded] = useState(false);
@@ -76,7 +76,8 @@ export function BrowserStage({ workers = 1 }: { workers?: number }) {
   const placeholder = frameError || status?.reason || status?.error || "正在连接虚拟屏幕…";
 
   return (
-    <Card className="overflow-hidden">
+    // 放大时在并排布局里独占整行，并取消吸顶，避免盖住下面的日志
+    <Card className={cn("overflow-hidden", expanded ? "xl:col-span-2" : className)}>
       <CardHeader className="border-b border-slate-100">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">

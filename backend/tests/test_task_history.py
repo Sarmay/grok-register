@@ -1,3 +1,4 @@
+import os
 import tempfile
 import time
 import unittest
@@ -7,6 +8,7 @@ from unittest import mock
 from backend.registration import engine
 from backend.registration.store import RegistrationRepository
 from backend.web.jobs import RegistrationJobCoordinator
+from backend.web import task_history
 from backend.web.relogin_jobs import ReloginJobCoordinator
 from backend.web.sso_check_jobs import SsoCheckJobCoordinator
 from backend.web.task_history import (
@@ -14,6 +16,9 @@ from backend.web.task_history import (
     KIND_RELOGIN,
     KIND_SSO_CHECK,
     TaskRunRecorder,
+    clear_log_files,
+    delete_log_file,
+    log_file_path,
     prune_history,
     retention_settings,
 )
@@ -177,6 +182,43 @@ class TaskRunRecorderTests(unittest.TestCase):
         missing = TaskRunRecorder(KIND_RELOGIN, "r", lambda: (_ for _ in ()).throw(RuntimeError("no db")))
         missing.append(1, "x")
         missing.finish(2.0, "finished", {})
+
+    def test_each_line_is_written_to_the_log_file_immediately(self):
+        repo = self._Repo()
+        recorder = TaskRunRecorder(KIND_REGISTRATION, "web-live", lambda: repo)
+        recorder.begin(100.0, {})
+        recorder.append(1, "第一行", "2026-09-23 09:00:00+08:00")
+        recorder.append(2, "第二行", "2026-09-23 09:00:01+08:00")
+        path = log_file_path(KIND_REGISTRATION, "web-live")
+        # 第二行还在 SQLite 的缓冲里，文件里已经能读到
+        self.assertEqual(
+            path.read_text(encoding="utf-8").splitlines(),
+            ["[2026-09-23 09:00:00+08:00] 第一行", "[2026-09-23 09:00:01+08:00] 第二行"],
+        )
+        recorder.finish(160.0, "finished", {})
+        self.assertIsNone(recorder._log_file)
+
+    def test_log_file_name_is_sanitized(self):
+        path = log_file_path(KIND_RELOGIN, "../evil/run id")
+        self.assertEqual(path.parent, task_history.TASK_LOG_DIR)
+        self.assertNotIn("/", path.name)
+
+    def test_log_files_follow_delete_clear_and_retention(self):
+        for run_id in ("a", "b", "c"):
+            path = log_file_path(KIND_SSO_CHECK, run_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x\n", encoding="utf-8")
+        old = log_file_path(KIND_SSO_CHECK, "a")
+        stale = time.time() - 3 * 86400
+        os.utime(old, (stale, stale))
+        prune_history(None, {"task_history_retention_days": 1, "task_history_retention_count": 0}, KIND_SSO_CHECK)
+        self.assertFalse(old.exists())
+        delete_log_file(KIND_SSO_CHECK, "b")
+        self.assertFalse(log_file_path(KIND_SSO_CHECK, "b").exists())
+        log_file_path(KIND_SSO_CHECK, "d").write_text("x\n", encoding="utf-8")
+        clear_log_files(KIND_SSO_CHECK, keep_run_id="d")
+        self.assertFalse(log_file_path(KIND_SSO_CHECK, "c").exists())
+        self.assertTrue(log_file_path(KIND_SSO_CHECK, "d").exists())
 
     def test_retention_settings_and_prune_helper(self):
         self.assertEqual(retention_settings({}), (60, 200))

@@ -54,25 +54,15 @@ class SignupFlowTests(unittest.TestCase):
                 signup_flow.getTurnstileToken(log_callback=logs.append, max_unsolved_clicks=2)
         click.assert_not_called()
 
-    def test_rejected_turnstile_refreshes_once_then_requests_new_exit(self):
+    def test_rejected_turnstile_requests_new_exit_without_reload(self):
         page = mock.Mock()
-        signup_flow.configure(
-            AccountRetryNeeded=engine.AccountRetryNeeded,
-            sleep_with_cancel=lambda *args, **kwargs: None,
-        )
+        signup_flow.configure(AccountRetryNeeded=engine.AccountRetryNeeded)
         with mock.patch.object(signup_flow, "page", page):
-            refreshed = signup_flow._reject_turnstile_or_refresh(
-                False,
-                signup_flow.TurnstileWidgetRejected("Verification failed"),
-            )
-            self.assertTrue(refreshed)
-            page.reload.assert_called_once_with()
             with self.assertRaises(engine.AccountRetryNeeded) as caught:
-                signup_flow._reject_turnstile_or_refresh(
-                    True,
-                    signup_flow.TurnstileWidgetRejected("Verification failed"),
-                )
+                signup_flow._reject_turnstile(signup_flow.TurnstileWidgetRejected("Verification failed"))
+        page.reload.assert_not_called()
         self.assertTrue(caught.exception.single_retry)
+        self.assertIn("更换出口", str(caught.exception))
 
     def test_turnstile_exit_retry_is_limited_to_one(self):
         exc = engine.AccountRetryNeeded("Turnstile 刷新后仍失败")
