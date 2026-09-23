@@ -1185,6 +1185,13 @@ def settle_mailnest_email(email, exc=None, *, sso="", failure_type="", log_callb
     address = str(email or mailnest_provider.active_email() or "").strip()
     if not address:
         return "ignored"
+    if isinstance(exc, mailnest_provider.ReceiveUnavailableError):
+        mailnest_provider.drop_order(address)
+        _mailnest_log(
+            log_callback,
+            f"[!] MailNest 收信接口拒绝该邮箱，已丢弃且不再释放: {address}: {exc}",
+        )
+        return "discarded"
     if str(sso or "").strip():
         mailnest_provider.drop_order(address)
         return "discarded"
@@ -3823,7 +3830,11 @@ def run_registration(count):
                         break
                     except Exception as mail_exc:
                         msg = str(mail_exc)
-                        if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                        if (
+                            not isinstance(mail_exc, mailnest_provider.ReceiveUnavailableError)
+                            and ("未收到验证码" in msg or "验证码" in msg)
+                            and mail_try < max_mail_retry
+                        ):
                             settle_mailnest_email(email, mail_exc, log_callback=registration_log)
                             _persist_result(
                                 started_at=mail_attempt_started_at,

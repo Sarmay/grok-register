@@ -26,6 +26,17 @@ REUSE_MARGIN_SECONDS = 180
 CODE_RATE_COOLDOWN_SECONDS = 60 * 60
 ALREADY_CHARGED = "D0004"
 
+
+class ReceiveUnavailableError(Exception):
+    """MailNest 当前无法对该邮箱执行收信操作。"""
+
+    def __init__(self, email: str, message: str = ""):
+        self.email = str(email or "").strip()
+        detail = message or "MailNest 当前无法对此邮箱执行收信操作"
+        if self.email and self.email not in detail:
+            detail = f"{detail}: {self.email}"
+        super().__init__(detail)
+
 STATE_INFLIGHT = "inflight"
 STATE_AVAILABLE = "available"
 
@@ -471,7 +482,12 @@ def receive_email(http_post: HttpPost, api_key: str, email: str) -> List[dict]:
         resp_json = resp.json()
     except Exception as exc:
         raise Exception(f"MailNest 收信响应无效: {exc}; body={resp.text[:300]}") from exc
-    if str(resp_json.get("code")) != "00000":
+    response_code = str(resp_json.get("code") or "")
+    if response_code == ALREADY_CHARGED:
+        message = str(resp_json.get("msg") or "")
+        detail = f"{ALREADY_CHARGED}: {message}" if message else ALREADY_CHARGED
+        raise ReceiveUnavailableError(email, detail)
+    if response_code != "00000":
         raise Exception(f"MailNest 收信失败: {resp.text[:500]}")
     return resp_json.get("data") or []
 
@@ -504,6 +520,8 @@ def wait_for_code(
         raise_if_cancelled(cancel_callback)
         try:
             mails = receive_email(http_post, api_key, email)
+        except ReceiveUnavailableError:
+            raise
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] MailNest 拉取邮件失败: {exc}")
