@@ -54,6 +54,7 @@ class CamoufoxProcessMatchTests(unittest.TestCase):
         }
         killed = []
         with (
+            mock.patch.object(browser_session, "_process_table_available", return_value=True),
             mock.patch.object(browser_session, "_linux_processes", return_value=processes),
             mock.patch.object(browser_session, "_cleanup_all_managed_profiles", return_value=2),
             mock.patch.object(browser_session.os, "kill", side_effect=lambda pid, sig: killed.append((pid, sig))),
@@ -79,6 +80,7 @@ class CamoufoxProcessMatchTests(unittest.TestCase):
         }
         killed = []
         with (
+            mock.patch.object(browser_session, "_process_table_available", return_value=True),
             mock.patch.object(browser_session, "_linux_processes", return_value=processes),
             mock.patch.object(browser_session, "_cleanup_all_managed_profiles", return_value=3),
             mock.patch.object(browser_session.os, "kill", side_effect=lambda pid, sig: killed.append((pid, sig))),
@@ -131,6 +133,7 @@ class BrowserLaunchInterruptTests(unittest.TestCase):
         }
         killed = []
         with (
+            mock.patch.object(browser_session, "_process_table_available", return_value=True),
             mock.patch.object(browser_session, "_linux_processes", return_value=processes),
             mock.patch.object(browser_session, "_cleanup_all_managed_profiles", return_value=1),
             mock.patch.object(browser_session.os, "kill", side_effect=lambda pid, sig: killed.append((pid, sig))),

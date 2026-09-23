@@ -280,7 +280,25 @@ class RegistrationRepository:
                     ON flagged_exit_ips(last_seen_at)
                 """
             )
-            conn.execute("PRAGMA user_version = 8")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mailnest_orders (
+                    email TEXT PRIMARY KEY,
+                    order_id TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'inflight',
+                    expired_at REAL NOT NULL DEFAULT 0,
+                    expired_at_text TEXT NOT NULL DEFAULT '',
+                    code_received INTEGER NOT NULL DEFAULT 0,
+                    sso_timeout_reused INTEGER NOT NULL DEFAULT 0,
+                    used_codes TEXT NOT NULL DEFAULT '[]',
+                    last_received_at REAL NOT NULL DEFAULT 0,
+                    last_code_at REAL NOT NULL DEFAULT 0,
+                    code_rate_limited_until REAL NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            conn.execute("PRAGMA user_version = 9")
 
     def add_result(self, record: Dict[str, Any]) -> int:
         now = self.now_text()
@@ -508,6 +526,28 @@ class RegistrationRepository:
                 ),
             )
 
+    def requeue_grokiq_delivery(self, registration_id: int) -> Dict[str, Any] | None:
+        """把投递失败（dead）或还没送达的事件重新排队：次数清零，立刻可投。"""
+        now_text = self.now_text()
+        now_epoch = _datetime.datetime.now().timestamp()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE grokiq_outbox
+                SET status = 'pending', attempts = 0, last_error = '', response_json = '',
+                    next_attempt_at = ?, updated_at = ?
+                WHERE registration_id = ? AND status != 'delivered'
+                """,
+                (now_epoch, now_text, int(registration_id)),
+            )
+            if not cursor.rowcount:
+                return None
+            row = conn.execute(
+                "SELECT * FROM grokiq_outbox WHERE registration_id = ?",
+                (int(registration_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def complete_grokiq_delivery(
         self,
         event_id: str,
@@ -611,6 +651,7 @@ class RegistrationRepository:
         keyword: str = "",
         batch_id: str = "",
         bot_risk: str = "",
+        grokiq_delivery: str = "",
     ) -> Tuple[str, List[Any]]:
         clauses = []
         params: List[Any] = []
@@ -661,6 +702,21 @@ class RegistrationRepository:
                 f"COALESCE(json_extract({extra_json_sql}, "
                 "'$.sso_check_status'), '') <> 'clean'"
             )
+        normalized_delivery = str(grokiq_delivery or "").strip().lower()
+        outbox_exists = (
+            "EXISTS (SELECT 1 FROM grokiq_outbox o "
+            "WHERE o.registration_id = registration_results.id{condition})"
+        )
+        if normalized_delivery == "dead":
+            clauses.append(outbox_exists.format(condition=" AND o.status = 'dead'"))
+        elif normalized_delivery in {"pending", "delivering", "queued"}:
+            clauses.append(
+                outbox_exists.format(condition=" AND o.status IN ('pending', 'delivering')")
+            )
+        elif normalized_delivery == "delivered":
+            clauses.append(outbox_exists.format(condition=" AND o.status = 'delivered'"))
+        elif normalized_delivery in {"not_queued", "none"}:
+            clauses.append("NOT " + outbox_exists.format(condition=""))
         normalized_keyword = str(keyword or "").strip()
         if normalized_keyword:
             like = f"%{normalized_keyword}%"
@@ -680,6 +736,7 @@ class RegistrationRepository:
         keyword: str = "",
         batch_id: str = "",
         bot_risk: str = "",
+        grokiq_delivery: str = "",
         limit: int = 2000,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
@@ -689,6 +746,7 @@ class RegistrationRepository:
             keyword=keyword,
             batch_id=batch_id,
             bot_risk=bot_risk,
+            grokiq_delivery=grokiq_delivery,
         )
         safe_limit = max(1, min(int(limit or 2000), 10000))
         safe_offset = max(0, int(offset or 0))
@@ -714,6 +772,7 @@ class RegistrationRepository:
         keyword: str = "",
         batch_id: str = "",
         bot_risk: str = "",
+        grokiq_delivery: str = "",
     ) -> int:
         """返回与账号列表相同筛选条件下的记录总数。"""
         where, params = self._result_filters(
@@ -722,6 +781,7 @@ class RegistrationRepository:
             keyword=keyword,
             batch_id=batch_id,
             bot_risk=bot_risk,
+            grokiq_delivery=grokiq_delivery,
         )
         with self._connect() as conn:
             row = conn.execute(
@@ -737,6 +797,7 @@ class RegistrationRepository:
         keyword: str = "",
         batch_id: str = "",
         bot_risk: str = "",
+        grokiq_delivery: str = "",
     ) -> List[int]:
         """返回与账号列表相同筛选条件下的全部主键，顺序与列表一致。"""
         where, params = self._result_filters(
@@ -745,6 +806,7 @@ class RegistrationRepository:
             keyword=keyword,
             batch_id=batch_id,
             bot_risk=bot_risk,
+            grokiq_delivery=grokiq_delivery,
         )
         with self._connect() as conn:
             rows = conn.execute(
@@ -1335,6 +1397,60 @@ class RegistrationRepository:
                 )
         return records
 
+    # ── MailNest 订单池 ──
+
+    def save_mailnest_order(self, payload: Dict[str, Any]) -> None:
+        email = str(payload.get("email") or "").strip()
+        if not email:
+            return
+        codes = payload.get("used_codes") or []
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO mailnest_orders (
+                    email, order_id, state, expired_at, expired_at_text, code_received,
+                    sso_timeout_reused, used_codes, last_received_at, last_code_at,
+                    code_rate_limited_until, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    email,
+                    str(payload.get("order_id") or ""),
+                    str(payload.get("state") or "inflight"),
+                    float(payload.get("expired_at") or 0.0),
+                    str(payload.get("expired_at_text") or ""),
+                    1 if payload.get("code_received") else 0,
+                    1 if payload.get("sso_timeout_reused") else 0,
+                    json.dumps(sorted(str(item) for item in codes), ensure_ascii=False),
+                    float(payload.get("last_received_at") or 0.0),
+                    float(payload.get("last_code_at") or 0.0),
+                    float(payload.get("code_rate_limited_until") or 0.0),
+                    self.now_text(),
+                ),
+            )
+
+    def delete_mailnest_order(self, email: str) -> None:
+        key = str(email or "").strip()
+        if not key:
+            return
+        with self._connect() as conn:
+            conn.execute("DELETE FROM mailnest_orders WHERE email = ?", (key,))
+
+    def list_mailnest_orders(self) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM mailnest_orders ORDER BY updated_at ASC, email ASC"
+            ).fetchall()
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["used_codes"] = json.loads(item.get("used_codes") or "[]")
+            except ValueError:
+                item["used_codes"] = []
+            items.append(item)
+        return items
+
     def stats(self) -> Dict[str, Any]:
 
         today = _datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
@@ -1368,8 +1484,18 @@ class RegistrationRepository:
                 ORDER BY total DESC, provider ASC
                 """
             ).fetchall()
+            outbox = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status = 'dead' THEN 1 ELSE 0 END) AS dead,
+                    SUM(CASE WHEN status IN ('pending', 'delivering') THEN 1 ELSE 0 END) AS pending
+                FROM grokiq_outbox
+                """
+            ).fetchone()
         result = {key: (row[key] or 0) for key in row.keys()}
         result["providers"] = [dict(item) for item in providers]
+        result["grokiq_dead"] = int(outbox["dead"] or 0)
+        result["grokiq_pending"] = int(outbox["pending"] or 0)
         return result
 
     def import_existing_accounts(self, accounts_dir: os.PathLike[str] | str) -> int:

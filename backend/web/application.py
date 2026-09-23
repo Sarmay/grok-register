@@ -980,6 +980,7 @@ def create_app() -> FastAPI:
         keyword: str = Query(""),
         batch_id: str = Query(""),
         bot_risk: str = Query(""),
+        grokiq_delivery: str = Query(""),
         limit: int = Query(20, ge=1, le=10000),
         offset: int = Query(0, ge=0),
     ) -> Dict[str, Any]:
@@ -989,12 +990,14 @@ def create_app() -> FastAPI:
         keyword_norm = str(q or keyword or "").strip()
         batch_norm = str(batch_id or "").strip()
         bot_risk_norm = str(bot_risk or "").strip().lower()
+        delivery_norm = str(grokiq_delivery or "").strip().lower()
         rows = store.list_results(
             status=status_norm,
             email_disable_status=str(email_disable_status or "").strip().lower(),
             keyword=keyword_norm,
             batch_id=batch_norm,
             bot_risk=bot_risk_norm,
+            grokiq_delivery=delivery_norm,
             limit=limit,
             offset=offset,
         )
@@ -1004,6 +1007,7 @@ def create_app() -> FastAPI:
             keyword=keyword_norm,
             batch_id=batch_norm,
             bot_risk=bot_risk_norm,
+            grokiq_delivery=delivery_norm,
         )
         grokiq_deliveries = store.grokiq_deliveries(
             [row.get("id") for row in rows]
@@ -1055,6 +1059,7 @@ def create_app() -> FastAPI:
         keyword: str = Query(""),
         batch_id: str = Query(""),
         bot_risk: str = Query(""),
+        grokiq_delivery: str = Query(""),
     ) -> Dict[str, Any]:
         store = _gr().get_registration_repository()
         ids = store.list_result_ids(
@@ -1063,6 +1068,7 @@ def create_app() -> FastAPI:
             keyword=str(q or keyword or "").strip(),
             batch_id=str(batch_id or "").strip(),
             bot_risk=str(bot_risk or "").strip().lower(),
+            grokiq_delivery=str(grokiq_delivery or "").strip().lower(),
         )
         return {"ok": True, "ids": ids, "total": len(ids)}
 
@@ -1336,6 +1342,21 @@ def create_app() -> FastAPI:
             "grokiqNotification": grokiq_notification,
             "item": _serialize_record(refreshed, delivery),
         }
+
+    @app.post("/api/accounts/{account_id}/grokiq/requeue")
+    def api_account_grokiq_requeue(account_id: int) -> Dict[str, Any]:
+        """把投递失败（dead）的 GrokIQ 通知重新排队，由后台线程立刻重投。"""
+        gr = _gr()
+        gr.load_config()
+        store = gr.get_registration_repository()
+        rows = store.get_results_by_ids([account_id])
+        if not rows:
+            raise HTTPException(status_code=404, detail="记录不存在")
+        event = store.requeue_grokiq_delivery(account_id)
+        if event is None:
+            raise HTTPException(status_code=409, detail="该账号没有待重投的 GrokIQ 通知")
+        grokiq.grokiq_notifier.wake()
+        return {"ok": True, "item": _serialize_record(rows[0], event)}
 
     @app.get("/api/accounts/{account_id}/failure-screenshot")
     def api_account_failure_screenshot(account_id: int) -> FileResponse:

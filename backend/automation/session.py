@@ -1000,6 +1000,11 @@ def _cleanup_all_managed_profiles(engine: Optional[str] = None) -> int:
     return cleaned
 
 
+def _process_table_available() -> bool:
+    """批量终止依赖 /proc 进程表；macOS 和 Windows 没有这个目录。"""
+    return os.name == "posix" and os.path.isdir("/proc")
+
+
 def _kill_browser_processes(
     matcher: Callable[[str, str], bool],
     *,
@@ -1007,7 +1012,7 @@ def _kill_browser_processes(
     label: str,
     log_callback=None,
 ) -> dict:
-    if os.name != "posix" or not os.path.isdir("/proc"):
+    if not _process_table_available():
         raise RuntimeError(f"当前系统暂不支持批量终止{label}")
 
     processes = _linux_processes()

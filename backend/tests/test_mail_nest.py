@@ -191,7 +191,7 @@ class MailNestPoolTests(unittest.TestCase):
     def test_release_rejected_as_charged_still_reuses(self):
         order = mail_nest.MailOrder(
             email="charged@outlook.com",
-            expired_at=time.time() + 1000,
+            expired_at=time.time() + 7200,
         )
         mail_nest.track_order(order)
 
@@ -204,7 +204,9 @@ class MailNestPoolTests(unittest.TestCase):
                 RuntimeError("MailNest 在 60s 内未收到验证码邮件"),
             )
         self.assertEqual(action, "reused")
-        claimed = mail_nest.claim_reusable(None)
+        # MailNest 说已扣费，说明刚有验证码到达：先冷却，再复用。
+        self.assertIsNone(mail_nest.claim_reusable(None))
+        claimed = mail_nest.claim_reusable(None, now=time.time() + mail_nest.CODE_RATE_COOLDOWN_SECONDS + 5)
         self.assertEqual(claimed.email, "charged@outlook.com")
         self.assertTrue(claimed.code_received)
 
@@ -252,3 +254,179 @@ class MailNestPoolTests(unittest.TestCase):
         )
         self.assertEqual(code, "222222")
         self.assertIn("222222", mail_nest.get_order("again@outlook.com").used_codes)
+
+
+class MailNestPoolPersistenceTests(unittest.TestCase):
+    """订单池挂上 SQLite 后，重启不能丢掉已扣费的邮箱。"""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from backend.registration.store import RegistrationRepository
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = RegistrationRepository(Path(self.tmp.name) / "results.sqlite3")
+        self.original_config = dict(gr.config)
+        gr.config["email_provider"] = "mailnest"
+        gr.config["mailnest_api_key"] = "test-key"
+        mail_nest.reset_pool()
+        mail_nest.bind_store(self.store)
+
+    def tearDown(self):
+        mail_nest.reset_pool()
+        gr.config.clear()
+        gr.config.update(self.original_config)
+        self.tmp.cleanup()
+
+    def _restart(self):
+        """模拟进程重启：清空内存，只保留数据库。"""
+        mail_nest.reset_pool()
+        mail_nest.bind_store(self.store)
+        return mail_nest.hydrate()
+
+    def test_charged_mailbox_survives_restart_and_is_reused(self):
+        order = mail_nest.MailOrder(email="kept@outlook.com", expired_at=time.time() + 7200)
+        mail_nest.track_order(order)
+        mail_nest.remember_received_code("kept@outlook.com", "123456", time.time())
+        self.assertTrue(mail_nest.recycle_order("kept@outlook.com"))
+
+        rows = self.store.list_mailnest_orders()
+        self.assertEqual([row["email"] for row in rows], ["kept@outlook.com"])
+        self.assertEqual(rows[0]["state"], mail_nest.STATE_AVAILABLE)
+        self.assertEqual(rows[0]["used_codes"], ["123456"])
+
+        result = self._restart()
+        self.assertEqual([item.email for item in result.restored], ["kept@outlook.com"])
+        self.assertEqual(result.stale, [])
+        # 刚收过验证码，冷却结束前不会被取走；冷却结束后继续复用。
+        self.assertIsNone(mail_nest.claim_reusable(None))
+        claimed = mail_nest.claim_reusable(None, now=time.time() + mail_nest.CODE_RATE_COOLDOWN_SECONDS + 5)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.email, "kept@outlook.com")
+        self.assertIn("123456", claimed.used_codes)
+        self.assertEqual(self.store.list_mailnest_orders()[0]["state"], mail_nest.STATE_INFLIGHT)
+
+    def test_dropped_mailbox_is_removed_from_storage(self):
+        mail_nest.track_order(mail_nest.MailOrder(email="gone@outlook.com", expired_at=time.time() + 7200))
+        self.assertEqual(len(self.store.list_mailnest_orders()), 1)
+        mail_nest.drop_order("gone@outlook.com")
+        self.assertEqual(self.store.list_mailnest_orders(), [])
+        self.assertEqual(self._restart().restored, [])
+
+    def test_expired_mailbox_is_not_restored(self):
+        order = mail_nest.MailOrder(email="old@outlook.com", expired_at=time.time() + 60, code_received=True)
+        mail_nest.track_order(order)
+        mail_nest.recycle_order("old@outlook.com")
+        # 落盘时还有余量，但重启后已经不够 3 分钟。
+        result = self._restart()
+        self.assertEqual(result.restored, [])
+        self.assertEqual(self.store.list_mailnest_orders(), [])
+
+    def test_unfinished_uncharged_mailbox_is_released_on_startup(self):
+        mail_nest.track_order(mail_nest.MailOrder(email="frozen@outlook.com", expired_at=time.time() + 7200))
+        mail_nest.reset_pool()
+        calls = []
+
+        def http_post(url, **kwargs):
+            calls.append((url, kwargs.get("json")))
+            return _response({"code": "00000", "data": None})
+
+        logs = []
+        with (
+            mock.patch.object(gr, "get_registration_repository", return_value=self.store),
+            mock.patch.object(gr, "http_post", http_post),
+        ):
+            gr.prepare_mailnest_pool(logs.append)
+            # 第二次调用不能再释放一遍。
+            gr.prepare_mailnest_pool(logs.append)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("/email/release", calls[0][0])
+        self.assertEqual(calls[0][1], {"email": "frozen@outlook.com"})
+        self.assertIsNone(mail_nest.get_order("frozen@outlook.com"))
+        self.assertEqual(self.store.list_mailnest_orders(), [])
+        self.assertTrue(any("退回冻结" in line for line in logs))
+
+    def test_startup_release_that_turns_out_charged_keeps_mailbox(self):
+        mail_nest.track_order(mail_nest.MailOrder(email="paid@outlook.com", expired_at=time.time() + 7200))
+        mail_nest.reset_pool()
+
+        def http_post(url, **kwargs):
+            return _response({"code": "D0004", "msg": "已扣费"})
+
+        with (
+            mock.patch.object(gr, "get_registration_repository", return_value=self.store),
+            mock.patch.object(gr, "http_post", http_post),
+        ):
+            gr.prepare_mailnest_pool()
+
+        rows = self.store.list_mailnest_orders()
+        self.assertEqual([row["email"] for row in rows], ["paid@outlook.com"])
+        self.assertEqual(rows[0]["state"], mail_nest.STATE_AVAILABLE)
+        self.assertTrue(rows[0]["code_received"])
+        self.assertIsNone(mail_nest.claim_reusable(None))
+        later = time.time() + mail_nest.CODE_RATE_COOLDOWN_SECONDS + 5
+        self.assertEqual(mail_nest.claim_reusable(None, now=later).email, "paid@outlook.com")
+
+    def test_storage_failure_does_not_break_the_pool(self):
+        broken = mock.Mock()
+        broken.save_mailnest_order.side_effect = RuntimeError("disk full")
+        broken.delete_mailnest_order.side_effect = RuntimeError("disk full")
+        broken.list_mailnest_orders.side_effect = RuntimeError("disk full")
+        mail_nest.reset_pool()
+        mail_nest.bind_store(broken)
+        self.assertEqual(mail_nest.hydrate().restored, [])
+        order = mail_nest.MailOrder(email="memory@outlook.com", expired_at=time.time() + 7200, code_received=True)
+        mail_nest.track_order(order)
+        self.assertTrue(mail_nest.recycle_order("memory@outlook.com"))
+        self.assertEqual(mail_nest.claim_reusable(None).email, "memory@outlook.com")
+
+
+class MailNestReuseCooldownTests(unittest.TestCase):
+    """刚收过验证码的邮箱要等满冷却再复用，否则下一次索码几乎必定被 xAI 限流。"""
+
+    def setUp(self):
+        self.original_config = dict(gr.config)
+        gr.config["email_provider"] = "mailnest"
+        gr.config["mailnest_api_key"] = "test-key"
+        mail_nest.reset_pool()
+
+    def tearDown(self):
+        mail_nest.reset_pool()
+        gr.config.clear()
+        gr.config.update(self.original_config)
+
+    def test_fresh_code_puts_mailbox_on_cooldown(self):
+        now = time.time()
+        order = mail_nest.MailOrder(email="fresh@outlook.com", expired_at=now + 7200)
+        mail_nest.track_order(order)
+        mail_nest.remember_received_code("fresh@outlook.com", "654321", now)
+        action = gr.settle_mailnest_email("fresh@outlook.com", RuntimeError("最终注册页资料填写失败"))
+        self.assertEqual(action, "reused")
+        self.assertIsNone(mail_nest.claim_reusable(None, now=now + 300))
+        claimed = mail_nest.claim_reusable(None, now=now + mail_nest.CODE_RATE_COOLDOWN_SECONDS + 1)
+        self.assertEqual(claimed.email, "fresh@outlook.com")
+
+    def test_cooldown_longer_than_remaining_life_drops_mailbox(self):
+        now = time.time()
+        order = mail_nest.MailOrder(
+            email="short@outlook.com",
+            expired_at=now + mail_nest.CODE_RATE_COOLDOWN_SECONDS + 60,
+        )
+        mail_nest.track_order(order)
+        mail_nest.remember_received_code("short@outlook.com", "111222", now)
+        action = gr.settle_mailnest_email("short@outlook.com", RuntimeError("最终注册页资料填写失败"))
+        self.assertEqual(action, "discarded")
+        self.assertIsNone(mail_nest.get_order("short@outlook.com"))
+
+    def test_old_code_does_not_block_reuse(self):
+        now = time.time()
+        order = mail_nest.MailOrder(
+            email="rested@outlook.com",
+            expired_at=now + 7200,
+            code_received=True,
+            last_code_at=now - mail_nest.CODE_RATE_COOLDOWN_SECONDS - 10,
+        )
+        mail_nest.track_order(order)
+        self.assertTrue(mail_nest.recycle_order("rested@outlook.com"))
+        self.assertEqual(mail_nest.claim_reusable(None, now=now).email, "rested@outlook.com")

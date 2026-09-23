@@ -329,3 +329,61 @@ class GrokIQOutboxTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GrokIQDeadLetterExitTests(unittest.TestCase):
+    """dead 状态必须能被看见、筛出来并重新排队。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = RegistrationRepository(Path(self.tmp.name) / "results.sqlite3")
+        self.dead_id = self.store.add_result({"email": "dead@example.com", "status": "success"})
+        self.ok_id = self.store.add_result({"email": "ok@example.com", "status": "success"})
+        self.plain_id = self.store.add_result({"email": "plain@example.com", "status": "success"})
+        for registration_id, email in ((self.dead_id, "dead@example.com"), (self.ok_id, "ok@example.com")):
+            self.store.enqueue_grokiq_event(
+                registration_id=registration_id,
+                email=email,
+                bot_risk=False,
+                bfs="",
+                occurred_at="2026-09-22T12:00:00Z",
+                sso="SSO",
+            )
+        dead_event = self.store.claim_grokiq_delivery()
+        self.store.abandon_grokiq_delivery(dead_event["event_id"], error="curl: (7) connection refused")
+        ok_event = self.store.claim_grokiq_delivery()
+        self.store.complete_grokiq_delivery(ok_event["event_id"])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_stats_count_dead_letters(self):
+        stats = self.store.stats()
+        self.assertEqual(stats["grokiq_dead"], 1)
+        self.assertEqual(stats["grokiq_pending"], 0)
+
+    def test_accounts_can_be_filtered_by_delivery_status(self):
+        dead = self.store.list_results(grokiq_delivery="dead")
+        self.assertEqual([row["email"] for row in dead], ["dead@example.com"])
+        self.assertEqual(self.store.count_results(grokiq_delivery="dead"), 1)
+        delivered = self.store.list_result_ids(grokiq_delivery="delivered")
+        self.assertEqual(delivered, [self.ok_id])
+        not_queued = self.store.list_result_ids(grokiq_delivery="not_queued")
+        self.assertEqual(not_queued, [self.plain_id])
+        self.assertEqual(len(self.store.list_results(grokiq_delivery="")), 3)
+
+    def test_requeue_resets_attempts_and_makes_event_claimable(self):
+        self.assertIsNone(self.store.claim_grokiq_delivery())
+        event = self.store.requeue_grokiq_delivery(self.dead_id)
+        self.assertEqual(event["status"], "pending")
+        self.assertEqual(event["attempts"], 0)
+        self.assertEqual(event["last_error"], "")
+        claimed = self.store.claim_grokiq_delivery()
+        self.assertEqual(claimed["registration_id"], self.dead_id)
+        self.assertEqual(claimed["attempts"], 1)
+        self.assertEqual(self.store.stats()["grokiq_dead"], 0)
+
+    def test_requeue_ignores_delivered_and_unknown_accounts(self):
+        self.assertIsNone(self.store.requeue_grokiq_delivery(self.ok_id))
+        self.assertIsNone(self.store.requeue_grokiq_delivery(self.plain_id))
+        self.assertIsNone(self.store.requeue_grokiq_delivery(999999))

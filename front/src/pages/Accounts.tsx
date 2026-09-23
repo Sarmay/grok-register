@@ -107,9 +107,16 @@ function grokiqDeliveryLabel(status: string) {
     pending: "等待投递",
     delivering: "正在投递",
     delivered: "已接收",
+    dead: "投递放弃",
     not_queued: "未加入队列",
   };
   return labels[status] || status || "未加入队列";
+}
+
+function grokiqDeliveryVariant(status: string) {
+  if (status === "delivered") return "success" as const;
+  if (status === "dead") return "destructive" as const;
+  return "warning" as const;
 }
 
 function grokiqResultLabel(result?: AccountRecord["grokiq_result"] | null) {
@@ -434,6 +441,8 @@ function AccountDetails({
   reloginRunning,
   reloginTaskRunning,
   reloginStage,
+  onRequeueGrokiq,
+  grokiqRequeueing,
 }: {
   detail: AccountRecord;
   showPassword: boolean;
@@ -446,6 +455,8 @@ function AccountDetails({
   reloginRunning: boolean;
   reloginTaskRunning: boolean;
   reloginStage: string;
+  onRequeueGrokiq: (item: AccountRecord) => void;
+  grokiqRequeueing: boolean;
 }) {
   const riskCheck = detail.sso_risk_check;
   const riskSource = riskCheck?.bot_flag_source;
@@ -526,7 +537,7 @@ function AccountDetails({
             Grok2API {remoteImportLabel(detail.grok2api_remote_status)}
           </Badge>
           {detail.grokiq_delivery?.status && detail.grokiq_delivery.status !== "not_queued" ? (
-            <Badge variant={cpaVariant(detail.grokiq_delivery.status === "delivered" ? "success" : "ready")}>
+            <Badge variant={grokiqDeliveryVariant(detail.grokiq_delivery.status)}>
               Webhook {grokiqDeliveryLabel(detail.grokiq_delivery.status)}
             </Badge>
           ) : null}
@@ -549,6 +560,40 @@ function AccountDetails({
         stage={reloginStage}
         onRelogin={onRelogin}
       />
+
+      {detail.grokiq_delivery?.status === "dead" ? (
+        <section className="overflow-hidden rounded-xl border border-red-200 bg-red-50/60">
+          <div className="flex flex-col gap-3 p-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0 text-sm leading-6 text-red-800">
+              <div className="flex items-center gap-2 font-semibold">
+                <ShieldAlert className="h-4 w-4 shrink-0" aria-hidden="true" />
+                GrokIQ 通知已放弃投递
+              </div>
+              <p className="mt-1 text-xs leading-5 text-red-700">
+                已尝试 {detail.grokiq_delivery.attempts} 次仍未送达，GrokIQ 不会对这个账号做降智检测。
+                确认 GrokIQ 服务和联动 Token 正常后可重新投递。
+              </p>
+              {detail.grokiq_delivery.last_error ? (
+                <p className="mt-1 break-words text-xs leading-5 text-red-700">最近错误：{detail.grokiq_delivery.last_error}</p>
+              ) : null}
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="shrink-0 border-red-200 bg-white text-red-700 hover:bg-red-100"
+              disabled={grokiqRequeueing}
+              onClick={() => onRequeueGrokiq(detail)}
+            >
+              {grokiqRequeueing ? (
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <UploadCloud className="h-4 w-4" aria-hidden="true" />
+              )}
+              {grokiqRequeueing ? "正在重新投递" : "重新投递到 GrokIQ"}
+            </Button>
+          </div>
+        </section>
+      ) : null}
 
       {riskCheck ? (
         <section className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50/80">
@@ -769,10 +814,12 @@ export function AccountsPage() {
   const initialKeyword = searchParams.get("q") || "";
   const initialBatchId = searchParams.get("batch_id") || "";
   const initialBotRisk = searchParams.get("bot_risk") || "";
+  const initialGrokiqDelivery = searchParams.get("grokiq_delivery") || "";
   const [items, setItems] = useState<AccountRecord[]>([]);
   const [status, setStatus] = useState(initialStatus);
   const [emailDisableStatus, setEmailDisableStatus] = useState("");
   const [botRiskFilter, setBotRiskFilter] = useState(initialBotRisk);
+  const [grokiqDeliveryFilter, setGrokiqDeliveryFilter] = useState(initialGrokiqDelivery);
   const [keyword, setKeyword] = useState(initialKeyword);
   const [batchIdFilter] = useState(initialBatchId);
   const [selected, setSelected] = useState<Record<number, boolean>>({});
@@ -798,6 +845,7 @@ export function AccountsPage() {
   const [deleteDialog, setDeleteDialog] = useState<{ ids: number[]; email: string } | null>(null);
   const [deleteBusy, setDeleteBusy] = useState<"" | "files" | "database">("");
   const [grok2apiImportingId, setGrok2apiImportingId] = useState<number | null>(null);
+  const [grokiqRequeueingId, setGrokiqRequeueingId] = useState<number | null>(null);
   const [moreMenu, setMoreMenu] = useState<{
     item: AccountRecord;
     top: number;
@@ -833,6 +881,7 @@ export function AccountsPage() {
         q: keyword,
         batchId: batchIdFilter || undefined,
         botRisk: botRiskFilter || undefined,
+        grokiqDelivery: grokiqDeliveryFilter || undefined,
         limit: targetPageSize,
         offset: (targetPage - 1) * targetPageSize,
       });
@@ -985,6 +1034,7 @@ export function AccountsPage() {
         q: keyword,
         batchId: batchIdFilter || undefined,
         botRisk: botRiskFilter || undefined,
+        grokiqDelivery: grokiqDeliveryFilter || undefined,
       });
       setSelected(Object.fromEntries((result.ids || []).map((id) => [id, true])));
       showToast(`已选择当前筛选结果 ${result.total} 个账号`, "success");
@@ -1204,6 +1254,20 @@ export function AccountsPage() {
     }
   };
 
+  const onRequeueGrokiq = async (item: AccountRecord) => {
+    setGrokiqRequeueingId(item.id);
+    try {
+      const response = await api.requeueGrokiqDelivery(item.id);
+      setItems((previous) => previous.map((value) => value.id === item.id ? response.item : value));
+      if (detail?.id === item.id) setDetail(response.item);
+      showToast("已重新加入 GrokIQ 投递队列", "success");
+    } catch (err: any) {
+      showToast(err.message || "重新投递失败", "error");
+    } finally {
+      setGrokiqRequeueingId(null);
+    }
+  };
+
   const openMoreMenu = (item: AccountRecord, button: HTMLButtonElement) => {
     const rect = button.getBoundingClientRect();
     const menuWidth = 224;
@@ -1415,6 +1479,23 @@ export function AccountsPage() {
               <option value="grokiq">GrokIQ 降智</option>
               <option value="0">正常账号</option>
               <option value="unknown">未检查 / 未知</option>
+            </Select>
+            </div>
+            <div className="w-full sm:w-48"><label htmlFor="account-grokiq-delivery-filter" className="mb-1.5 block text-xs font-medium text-slate-500">GrokIQ 通知</label>
+            <Select
+              id="account-grokiq-delivery-filter"
+              value={grokiqDeliveryFilter}
+              onChange={(e) => {
+                setGrokiqDeliveryFilter(e.target.value);
+                setSelected({});
+              }}
+              aria-label="按 GrokIQ Webhook 投递状态筛选"
+            >
+              <option value="">不限</option>
+              <option value="dead">投递放弃</option>
+              <option value="pending">等待投递</option>
+              <option value="delivered">已接收</option>
+              <option value="not_queued">未加入队列</option>
             </Select>
             </div>
             <div className="w-full min-w-0 sm:min-w-72 sm:flex-1"><label htmlFor="account-search" className="mb-1.5 block text-xs font-medium text-slate-500">搜索账号</label><div className="relative">
@@ -1822,6 +1903,8 @@ export function AccountsPage() {
                 reloginRunning={!!relogin?.running && relogin.account_id === detail.id}
                 reloginTaskRunning={!!relogin?.running}
                 reloginStage={relogin?.stage || ""}
+                onRequeueGrokiq={(item) => void onRequeueGrokiq(item)}
+                grokiqRequeueing={grokiqRequeueingId === detail.id}
               />
             </div>
           </section>

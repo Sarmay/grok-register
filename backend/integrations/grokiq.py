@@ -18,8 +18,10 @@ from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
-# 失败后退避最高约 300 秒，但次数必须封顶，否则一条坏 webhook 会一直刷日志。
-GROKIQ_MAX_DELIVERY_ATTEMPTS = 8
+# 失败后退避最高 300 秒，之后每 5 分钟一次。次数必须封顶，否则一条坏 webhook 会一直刷日志；
+# 但 8 次只覆盖约 8 分钟，GrokIQ 重启或宿主机断网就会把事件判死。96 次约 8 小时，
+# 能撑过 2026-09-18 那种整晚停机；超过后进入 dead，可在账号页手动重新投递。
+GROKIQ_MAX_DELIVERY_ATTEMPTS = 96
 
 
 class GrokIQDeliveryError(RuntimeError):

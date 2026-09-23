@@ -1097,8 +1097,34 @@ def _mailnest_log(log_callback, message: str) -> None:
     registration_log(message)
 
 
+def prepare_mailnest_pool(log_callback=None) -> None:
+    """把订单池挂到 SQLite，并找回上次进程留下的邮箱。
+
+    已扣费且没过期的继续复用；没收到过验证码的调释放接口把冻结金额退回。
+    每个进程只恢复一次，重复调用没有副作用。
+    """
+    if not _using_mailnest():
+        return
+    try:
+        store = get_registration_repository()
+    except Exception as exc:
+        _mailnest_log(log_callback, f"[!] MailNest 订单池无法持久化，本次只保存在内存: {exc}")
+        return
+    mailnest_provider.bind_store(store)
+    result = mailnest_provider.hydrate()
+    if result.restored:
+        _mailnest_log(
+            log_callback,
+            f"[*] MailNest 找回 {len(result.restored)} 个已扣费邮箱，冷却结束后继续复用",
+        )
+    for order in result.stale:
+        _mailnest_log(log_callback, f"[*] MailNest 上次没用完的邮箱，尝试释放退回冻结: {order.email}")
+        _mailnest_release(order.email, log_callback)
+
+
 def acquire_mailnest_email(log_callback=None) -> str:
     """优先复用已扣费且未过期的邮箱，否则新购买。"""
+    prepare_mailnest_pool(log_callback)
     key = get_mailnest_api_key()
     project = get_mailnest_project_code()
     order = mailnest_provider.claim_reusable(email_registered_successfully)
@@ -1134,10 +1160,7 @@ def _mailnest_release(email: str, log_callback=None) -> str:
         _mailnest_log(log_callback, f"[*] MailNest 未收到验证码，已释放并退回冻结: {email}")
         return "released"
     if result == "charged":
-        order = mailnest_provider.get_order(email)
-        if order is not None and not order.code_received:
-            order.code_received = True
-            order.last_received_at = max(order.last_received_at, time.time())
+        mailnest_provider.mark_charged(email)
         if mailnest_provider.recycle_order(email):
             _mailnest_log(log_callback, f"[*] MailNest 邮箱已扣费，改为继续复用: {email}")
             return "reused"
@@ -3294,6 +3317,10 @@ def run_registration(count):
             return
     except Exception as exc:
         registration_log(f"[!] 启动连通性检查异常，继续注册: {exc}")
+    try:
+        prepare_mailnest_pool(registration_log)
+    except Exception as exc:
+        registration_log(f"[!] MailNest 订单池恢复异常，继续注册: {exc}")
 
     def _record_failure(exc):
         nonlocal fail_count

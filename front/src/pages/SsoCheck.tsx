@@ -41,11 +41,24 @@ function sourceLabel(value: number | string | null) {
   return value === null || value === "" ? "未知" : String(value);
 }
 
-function resultNote(item: SsoCheckItem) {
+function resultNote(item: Pick<SsoCheckItem, "status" | "bot_flag_source" | "error">) {
   if (item.status === "clean") return "botFlagSource=0";
   if (item.status === "flagged") return `botFlagSource=${sourceLabel(item.bot_flag_source)}`;
   if (item.status === "pending") return "等待检查";
   return item.error || "未读取到稳定的 botFlagSource";
+}
+
+/** 把账号记录里可选字段的 SSO 检查结果转成 resultNote 需要的形状。 */
+function accountRiskNote(item: AccountRecord) {
+  const check = item.sso_risk_check;
+  if (!check) return "";
+  const source = check.bot_flag_source ?? null;
+  const clean = source === 0 || source === "0";
+  return resultNote({
+    status: item.bot_risk ? "flagged" : clean ? "clean" : "unknown",
+    bot_flag_source: source,
+    error: check.error ?? "",
+  });
 }
 
 function formatWhen(value: number | null | undefined) {
@@ -377,12 +390,12 @@ export function SsoCheckPage() {
               <table className="w-full min-w-[980px] text-left text-sm">
                 <thead className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500"><tr><th className="w-12 px-4 py-3"><span className="sr-only">选择账号</span></th><th className="px-4 py-3 font-medium">账号</th><th className="px-4 py-3 font-medium">邮箱来源</th><th className="w-[160px] px-4 py-3 font-medium">创建时间</th><th className="px-4 py-3 font-medium">SSO 文件</th><th className="px-4 py-3 font-medium">风控结果</th><th className="px-4 py-3 font-medium">检查信息</th></tr></thead>
                 <tbody className="divide-y divide-slate-100">
-                  {accounts.map((item) => { const risk = accountSsoStatus(item); return <tr key={item.id} className={`hover:bg-slate-50/70 ${!item.sso_available ? "opacity-60" : ""}`}><td className="px-4 py-3"><input type="checkbox" disabled={!item.sso_available} checked={!!selected[item.id]} onChange={(event) => setSelected((old) => ({ ...old, [item.id]: event.target.checked }))} /></td><td className="max-w-[280px] px-4 py-3"><AccountEmailLabel email={item.email} botRisk={!!item.bot_risk} /></td><td className="px-4 py-3"><EmailProviderLabel provider={item.provider} /></td><td className="whitespace-nowrap px-4 py-3 text-xs text-slate-500">{item.finished_at || item.started_at || "未记录"}</td><td className="px-4 py-3"><Badge variant={item.sso_available ? "success" : "secondary"}>{item.sso_available ? "有效" : "缺失"}</Badge></td><td className="px-4 py-3"><Badge variant={risk.variant}>{risk.label}</Badge></td><td className="max-w-[280px] px-4 py-3 text-xs text-slate-500"><span className="block truncate" title={item.sso_risk_check?.error || item.account_file || ""}>{item.sso_risk_check ? resultNote({ account_id: item.id, email: item.email, status: item.bot_risk ? "flagged" : item.sso_risk_check.bot_flag_source === 0 ? "clean" : "unknown", bot_flag_source: item.sso_risk_check.bot_flag_source, error: item.sso_risk_check.error, response_ms: item.sso_risk_check.response_ms, attempts: 1 }) : item.sso_available ? "等待检查" : "未找到 SSO 文件"}</span></td></tr>; })}
+                  {accounts.map((item) => { const risk = accountSsoStatus(item); return <tr key={item.id} className={`hover:bg-slate-50/70 ${!item.sso_available ? "opacity-60" : ""}`}><td className="px-4 py-3"><input type="checkbox" disabled={!item.sso_available} checked={!!selected[item.id]} onChange={(event) => setSelected((old) => ({ ...old, [item.id]: event.target.checked }))} /></td><td className="max-w-[280px] px-4 py-3"><AccountEmailLabel email={item.email} botRisk={!!item.bot_risk} /></td><td className="px-4 py-3"><EmailProviderLabel provider={item.provider} /></td><td className="whitespace-nowrap px-4 py-3 text-xs text-slate-500">{item.finished_at || item.started_at || "未记录"}</td><td className="px-4 py-3"><Badge variant={item.sso_available ? "success" : "secondary"}>{item.sso_available ? "有效" : "缺失"}</Badge></td><td className="px-4 py-3"><Badge variant={risk.variant}>{risk.label}</Badge></td><td className="max-w-[280px] px-4 py-3 text-xs text-slate-500"><span className="block truncate" title={item.sso_risk_check?.error || item.account_file || ""}>{item.sso_risk_check ? accountRiskNote(item) : item.sso_available ? "等待检查" : "未找到 SSO 文件"}</span></td></tr>; })}
                 </tbody>
               </table>
             </div>
             <div className="divide-y divide-slate-100 md:hidden">
-              {accounts.map((item) => { const risk = accountSsoStatus(item); return <label key={item.id} className={`flex items-start gap-3 p-4 ${!item.sso_available ? "opacity-60" : ""}`}><input type="checkbox" className="mt-1" disabled={!item.sso_available} checked={!!selected[item.id]} onChange={(event) => setSelected((old) => ({ ...old, [item.id]: event.target.checked }))} /><div className="min-w-0 flex-1"><div className="flex items-start justify-between gap-3"><div className="flex min-w-0 flex-1 items-start gap-2"><AccountEmailLabel email={item.email} botRisk={!!item.bot_risk} className="min-w-0 flex-1" /><EmailProviderIcon provider={item.provider} /></div><Badge variant={risk.variant}>{risk.label}</Badge></div><div className="mt-1 text-xs text-slate-500">创建于 {item.finished_at || item.started_at || "未记录"}</div><div className="mt-2 flex flex-wrap gap-1.5"><Badge variant={item.sso_available ? "success" : "secondary"}>SSO {item.sso_available ? "有效" : "缺失"}</Badge>{item.sso_risk_check ? <span className="text-xs text-slate-500">{resultNote({ account_id: item.id, email: item.email, status: item.bot_risk ? "flagged" : item.sso_risk_check.bot_flag_source === 0 ? "clean" : "unknown", bot_flag_source: item.sso_risk_check.bot_flag_source, error: item.sso_risk_check.error, response_ms: item.sso_risk_check.response_ms, attempts: 1 })}</span> : null}</div></div></label>; })}
+              {accounts.map((item) => { const risk = accountSsoStatus(item); return <label key={item.id} className={`flex items-start gap-3 p-4 ${!item.sso_available ? "opacity-60" : ""}`}><input type="checkbox" className="mt-1" disabled={!item.sso_available} checked={!!selected[item.id]} onChange={(event) => setSelected((old) => ({ ...old, [item.id]: event.target.checked }))} /><div className="min-w-0 flex-1"><div className="flex items-start justify-between gap-3"><div className="flex min-w-0 flex-1 items-start gap-2"><AccountEmailLabel email={item.email} botRisk={!!item.bot_risk} className="min-w-0 flex-1" /><EmailProviderIcon provider={item.provider} /></div><Badge variant={risk.variant}>{risk.label}</Badge></div><div className="mt-1 text-xs text-slate-500">创建于 {item.finished_at || item.started_at || "未记录"}</div><div className="mt-2 flex flex-wrap gap-1.5"><Badge variant={item.sso_available ? "success" : "secondary"}>SSO {item.sso_available ? "有效" : "缺失"}</Badge>{item.sso_risk_check ? <span className="text-xs text-slate-500">{accountRiskNote(item)}</span> : null}</div></div></label>; })}
             </div>
           </>
         ) : <div className="p-4"><EmptyState title="暂无账号" description="账号保存 SSO 后即可在这里执行详细检查。" /></div>}

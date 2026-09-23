@@ -114,7 +114,7 @@ class FailureScreenshotTests(unittest.TestCase):
 
     def test_screenshot_is_collected_and_deleted_with_account_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             accounts = root / "accounts"
             accounts.mkdir()
             screenshot = root / "screenshots" / "registration-failures" / "failure.png"

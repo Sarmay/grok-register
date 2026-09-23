@@ -185,6 +185,8 @@ export type Stats = {
   today_success: number;
   unique_success_emails: number;
   avg_success_seconds: number;
+  grokiq_dead?: number;
+  grokiq_pending?: number;
   providers?: Array<{ provider: string; total: number; success: number }>;
 };
 
@@ -413,6 +415,7 @@ export const api = {
       q?: string;
       batchId?: string;
       botRisk?: string;
+      grokiqDelivery?: string;
       limit?: number;
       offset?: number;
     } = {}
@@ -423,6 +426,7 @@ export const api = {
     if (params.q) sp.set("q", params.q);
     if (params.batchId) sp.set("batch_id", params.batchId);
     if (params.botRisk) sp.set("bot_risk", params.botRisk);
+    if (params.grokiqDelivery) sp.set("grokiq_delivery", params.grokiqDelivery);
     if (params.limit) sp.set("limit", String(params.limit));
     if (params.offset) sp.set("offset", String(params.offset));
     const qs = sp.toString();
@@ -445,6 +449,7 @@ export const api = {
       q?: string;
       batchId?: string;
       botRisk?: string;
+      grokiqDelivery?: string;
     } = {}
   ) => {
     const sp = new URLSearchParams();
@@ -453,6 +458,7 @@ export const api = {
     if (params.q) sp.set("q", params.q);
     if (params.batchId) sp.set("batch_id", params.batchId);
     if (params.botRisk) sp.set("bot_risk", params.botRisk);
+    if (params.grokiqDelivery) sp.set("grokiq_delivery", params.grokiqDelivery);
     const qs = sp.toString();
     return request<{ ok: boolean; ids: number[]; total: number }>(
       `/api/accounts/select-ids${qs ? `?${qs}` : ""}`
@@ -517,6 +523,10 @@ export const api = {
       result: { created?: number; updated?: number; synced?: number; syncFailed?: number };
       item: AccountRecord;
     }>(`/api/accounts/${id}/grok2api/import`, { method: "POST" }),
+  requeueGrokiqDelivery: (id: number) =>
+    request<{ ok: boolean; item: AccountRecord }>(`/api/accounts/${id}/grokiq/requeue`, {
+      method: "POST",
+    }),
   deleteAccounts: (ids: number[], deleteFiles = true) =>
     request<{ ok: boolean; deleted: number; deleted_files: number; side_lines: number; file_errors: string[] }>(
       "/api/accounts/delete",

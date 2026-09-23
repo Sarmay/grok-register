@@ -31,7 +31,7 @@ class WebAuthJsonTests(unittest.TestCase):
 
     def test_loads_cpa_and_grok2api_json_from_configured_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             cpa_dir = root / "cpa"
             g2a_dir = root / "g2a"
             cpa_dir.mkdir()
@@ -66,7 +66,7 @@ class WebAuthJsonTests(unittest.TestCase):
 
     def test_file_finder_does_not_parse_content_for_download(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             invalid_json = root / "xai-user@example.com.json"
             invalid_json.write_text("not parsed by download path", encoding="utf-8")
             record = {"email": "user@example.com", "cpa_auth_path": str(invalid_json)}
@@ -84,7 +84,7 @@ class WebAuthJsonTests(unittest.TestCase):
 
     def test_batch_archive_exports_available_files_and_reports_skips(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             auth_file = root / "xai-user@example.com.json"
             auth_file.write_text(json.dumps({"email": "user@example.com"}), encoding="utf-8")
             records = [
@@ -107,7 +107,7 @@ class WebAuthJsonTests(unittest.TestCase):
 
     def test_sso_export_only_contains_token_segment(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             account_file = root / "user@example.com.txt"
             token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.fixture.signature"
             account_file.write_text(f"user@example.com----password-value----{token}\n", encoding="utf-8")
@@ -151,7 +151,7 @@ class WebAuthJsonTests(unittest.TestCase):
 
     def test_actionable_auth_export_ids_only_include_matching_available_files(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             available = root / "xai-user@example.com.json"
             available.write_text("{}", encoding="utf-8")
             store = mock.Mock()

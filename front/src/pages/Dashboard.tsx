@@ -10,6 +10,7 @@ import {
   Play,
   RefreshCw,
   ServerCog,
+  ShieldAlert,
   Users,
 } from "lucide-react";
 import { api, type JobStatus, type Stats } from "@/lib/api";
@@ -90,6 +91,21 @@ export function DashboardPage() {
       />
 
       {error ? <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">{error}</div> : null}
+
+      {(stats?.grokiq_dead ?? 0) > 0 ? (
+        <div className="flex flex-col gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-2 leading-6">
+            <ShieldAlert className="mt-1 h-4 w-4 shrink-0" aria-hidden="true" />
+            <span>
+              {stats?.grokiq_dead} 个账号的 GrokIQ 通知已放弃投递，这些账号不会被自动做降智检测。
+              请确认 GrokIQ 服务和联动 Token 正常，再到账号详情中重新投递。
+            </span>
+          </div>
+          <Link to="/accounts?grokiq_delivery=dead" className={buttonVariants({ variant: "outline", className: "shrink-0 border-red-200 bg-white text-red-700 hover:bg-red-100" })}>
+            查看这些账号
+          </Link>
+        </div>
+      ) : null}
 
       <Card className="overflow-hidden" aria-label="核心统计">
         <section className="grid grid-cols-2 divide-x divide-y divide-slate-200 md:grid-cols-4 md:divide-y-0">
