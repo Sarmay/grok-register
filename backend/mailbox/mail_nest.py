@@ -13,7 +13,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, List, Optional
 
 from backend.mailbox.utilities import extract_verification_code
@@ -25,6 +25,8 @@ REUSE_MARGIN_SECONDS = 180
 # 刚收过验证码的地址会主动等满这段时间再复用；否则下一次索码几乎必定被拒，白白浪费一次尝试。
 CODE_RATE_COOLDOWN_SECONDS = 60 * 60
 ALREADY_CHARGED = "D0004"
+# MailNest 返回的时间不带时区，实际是北京时间，例如买号时的 "2026-09-23 18:40:44"。
+API_TIMEZONE = timezone(timedelta(hours=8))
 
 
 class ReceiveUnavailableError(Exception):
@@ -103,11 +105,14 @@ class MailOrder:
                 codes = json.loads(codes or "[]")
             except ValueError:
                 codes = []
+        expired_at_text = str(payload.get("expired_at_text") or "")
+        # 以原始文本为准重新计算，旧版本按 UTC 解析存下的时间戳会多出 8 小时。
+        expired_at = parse_time(expired_at_text) or float(payload.get("expired_at") or 0.0)
         return cls(
             email=str(payload.get("email") or "").strip(),
             order_id=str(payload.get("order_id") or ""),
-            expired_at=float(payload.get("expired_at") or 0.0),
-            expired_at_text=str(payload.get("expired_at_text") or ""),
+            expired_at=expired_at,
+            expired_at_text=expired_at_text,
             code_received=bool(payload.get("code_received")),
             sso_timeout_reused=bool(payload.get("sso_timeout_reused")),
             used_codes={str(item) for item in codes if str(item)},
@@ -235,7 +240,7 @@ def parse_time(value: Any) -> float:
     except ValueError:
         return 0.0
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=API_TIMEZONE)
     return parsed.timestamp()
 
 

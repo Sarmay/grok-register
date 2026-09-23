@@ -46,6 +46,13 @@ class MailNestPoolTests(unittest.TestCase):
         self.assertEqual(order.order_id, "order-1")
         self.assertGreater(order.expired_at, 0)
 
+    def test_naive_expiry_is_beijing_time(self):
+        # 真实买号响应：18:20:44 买入，有效至 18:40:44，只有 20 分钟。
+        expired_at = mail_nest.parse_time("2026-09-23 18:40:44")
+        self.assertEqual(expired_at, mail_nest.parse_time("2026-09-23T18:40:44+08:00"))
+        bought_at = mail_nest.parse_time("2026-09-23T18:20:44+08:00")
+        self.assertEqual(expired_at - bought_at, 20 * 60)
+
     def test_unreceived_mailbox_is_released(self):
         order = mail_nest.MailOrder(
             email="fresh@outlook.com",
@@ -305,6 +312,23 @@ class MailNestPoolPersistenceTests(unittest.TestCase):
         self.assertEqual(claimed.email, "kept@outlook.com")
         self.assertIn("123456", claimed.used_codes)
         self.assertEqual(self.store.list_mailnest_orders()[0]["state"], mail_nest.STATE_INFLIGHT)
+
+    def test_expiry_saved_as_utc_is_recomputed_on_restart(self):
+        # 旧版本把 "18:40:44" 当 UTC 存下，时间戳多出 8 小时，重启后看起来还能用很久。
+        text = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + 8 * 3600 - 600))
+        order = mail_nest.MailOrder(
+            email="stale@outlook.com",
+            expired_at=time.time() + 8 * 3600 - 600,
+            expired_at_text=text,
+            code_received=True,
+            last_code_at=time.time() - mail_nest.CODE_RATE_COOLDOWN_SECONDS - 10,
+        )
+        mail_nest.track_order(order)
+        mail_nest.recycle_order("stale@outlook.com")
+
+        result = self._restart()
+        self.assertEqual(result.restored, [])
+        self.assertEqual(self.store.list_mailnest_orders(), [])
 
     def test_dropped_mailbox_is_removed_from_storage(self):
         mail_nest.track_order(mail_nest.MailOrder(email="gone@outlook.com", expired_at=time.time() + 7200))
