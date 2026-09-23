@@ -2882,49 +2882,67 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 
-def _page_host(page_obj) -> str:
-    url = str(getattr(page_obj, "url", "") or "")
-    return (urlsplit(url).hostname or "").lower()
+_NSFW_REDIRECT_WAIT_SECONDS = 15
+_NSFW_RETRY_REDIRECT_WAIT_SECONDS = 5
+_NSFW_GOTO_TIMEOUT_MS = 20_000
+
+
+def _is_grok_url(url) -> bool:
+    host = (urlsplit(str(url or "")).hostname or "").lower()
+    return host == "grok.com" or host.endswith(".grok.com")
+
+
+def _wait_until_on_grok(page_obj, timeout: float) -> bool:
+    """等页面自己的跳转落到 grok.com（只等导航提交，不等 DOM）。"""
+    if _is_grok_url(getattr(page_obj, "url", "")):
+        return True
+    raw = getattr(page_obj, "raw_page", None)
+    if raw is not None and hasattr(raw, "wait_for_url"):
+        try:
+            raw.wait_for_url(_is_grok_url, wait_until="commit", timeout=int(timeout * 1000))
+            return True
+        except Exception:
+            return _is_grok_url(getattr(page_obj, "url", ""))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        if _is_grok_url(getattr(page_obj, "url", "")):
+            return True
+    return False
 
 
 def _open_grok_for_nsfw(page_obj, log_callback=None) -> None:
-    """等当前跳转结束再打开 grok.com。已在 grok.com 时不再导航。
+    """让浏览器停在 grok.com。优先等注册自身的跳转落地，落不了再主动导航。
 
-    注册刚拿到 SSO 时，accounts.x.ai 的跳转往往还没结束。立刻再 goto
-    会在 Camoufox 上撞成 NS_BINDING_ABORTED。
+    注册提交后 accounts.x.ai 会自己跳到 grok.com（redirect=grok-com），SSO
+    cookie 在跳转途中就已写入。此时立刻 goto 会和这次跳转互相打断：Camoufox
+    上报 NS_BINDING_ABORTED，或者 goto 一直等不到 DOM 直到超时。
     """
-    def _wait_for_document():
-        waiter = getattr(page_obj, "wait", None)
-        if waiter is None or not hasattr(waiter, "doc_loaded"):
-            return
-        try:
-            waiter.doc_loaded(timeout=8)
-        except Exception:
-            pass
-
-    def _already_on_grok() -> bool:
-        host = _page_host(page_obj)
-        return host == "grok.com" or host.endswith(".grok.com")
-
-    _wait_for_document()
-    if _already_on_grok():
+    if _wait_until_on_grok(page_obj, _NSFW_REDIRECT_WAIT_SECONDS):
         if log_callback:
-            log_callback("[*] 浏览器已在 grok.com，跳过重复打开")
+            log_callback("[*] 注册跳转已到达 grok.com，无需再打开")
         return
+    if log_callback:
+        log_callback(
+            f"[!] {_NSFW_REDIRECT_WAIT_SECONDS} 秒内未跳到 grok.com，主动打开 "
+            f"(当前 {getattr(page_obj, 'url', '') or '-'})"
+        )
     for attempt in (1, 2):
         try:
-            page_obj.get("https://grok.com/")
+            page_obj.get("https://grok.com/", timeout=_NSFW_GOTO_TIMEOUT_MS)
             return
         except Exception as exc:
-            if "NS_BINDING_ABORTED" not in str(exc) or attempt == 2:
+            # goto 超时或被打断时，导航可能已经提交到 grok.com，后面还会再等 DOM。
+            if _is_grok_url(getattr(page_obj, "url", "")):
+                return
+            if attempt == 2:
                 raise
             if log_callback:
-                log_callback("[!] 打开 grok.com 与当前跳转冲突，1 秒后重试")
-            time.sleep(1)
-            _wait_for_document()
-            if _already_on_grok():
+                reason = str(exc).splitlines()[0][:120]
+                log_callback(f"[!] 打开 grok.com 失败，重试一次: {reason}")
+            if _wait_until_on_grok(page_obj, _NSFW_RETRY_REDIRECT_WAIT_SECONDS):
                 if log_callback:
-                    log_callback("[*] 冲突后的跳转已到达 grok.com")
+                    log_callback("[*] 重试前跳转已到达 grok.com")
                 return
 
 

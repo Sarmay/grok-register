@@ -70,27 +70,75 @@ class SignupFlowTests(unittest.TestCase):
         self.assertEqual(engine.account_retry_limit(exc, 3), 1)
         self.assertEqual(engine.account_retry_limit(engine.AccountRetryNeeded("卡住"), 3), 3)
 
-    def test_nsfw_navigation_waits_and_retries_binding_abort(self):
+    SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+
+    def _stuck_signup_page(self):
         page = mock.Mock()
-        page.url = "https://accounts.x.ai/sign-up?redirect=grok-com"
-        page.wait = mock.Mock()
-        page.get.side_effect = [
-            Exception("Page.goto: NS_BINDING_ABORTED; maybe frame was detached?"),
-            None,
-        ]
-        logs = []
-        with mock.patch.object(engine.time, "sleep"):
-            engine._open_grok_for_nsfw(page, log_callback=logs.append)
-        self.assertEqual(page.wait.doc_loaded.call_count, 2)
-        page.wait.doc_loaded.assert_called_with(timeout=8)
-        self.assertEqual(page.get.call_count, 2)
-        self.assertTrue(any("1 秒后重试" in line for line in logs))
+        page.url = self.SIGNUP_URL
+        page.raw_page.wait_for_url.side_effect = Exception("Timeout 15000ms exceeded.")
+        return page
 
     def test_nsfw_navigation_skips_goto_when_already_on_grok(self):
         page = mock.Mock()
         page.url = "https://grok.com/"
         engine._open_grok_for_nsfw(page)
         page.get.assert_not_called()
+        page.raw_page.wait_for_url.assert_not_called()
+
+    def test_nsfw_navigation_waits_for_signup_redirect_instead_of_goto(self):
+        page = mock.Mock()
+        page.url = self.SIGNUP_URL
+
+        def land_on_grok(predicate, **kwargs):
+            self.assertFalse(predicate(self.SIGNUP_URL))
+            self.assertTrue(predicate("https://grok.com/?referrer=x"))
+            page.url = "https://grok.com/"
+
+        page.raw_page.wait_for_url.side_effect = land_on_grok
+        logs = []
+        engine._open_grok_for_nsfw(page, log_callback=logs.append)
+        page.get.assert_not_called()
+        kwargs = page.raw_page.wait_for_url.call_args.kwargs
+        self.assertEqual(kwargs["wait_until"], "commit")
+        self.assertEqual(kwargs["timeout"], engine._NSFW_REDIRECT_WAIT_SECONDS * 1000)
+        self.assertTrue(any("跳转已到达 grok.com" in line for line in logs))
+
+    def test_nsfw_navigation_opens_grok_when_redirect_never_lands(self):
+        page = self._stuck_signup_page()
+        engine._open_grok_for_nsfw(page)
+        page.get.assert_called_once_with(
+            "https://grok.com/", timeout=engine._NSFW_GOTO_TIMEOUT_MS
+        )
+
+    def test_nsfw_navigation_retries_after_goto_timeout(self):
+        page = self._stuck_signup_page()
+        page.get.side_effect = [
+            Exception('Page.goto: Timeout 20000ms exceeded.\nCall log:\n  - navigating to "https://grok.com/"'),
+            None,
+        ]
+        logs = []
+        engine._open_grok_for_nsfw(page, log_callback=logs.append)
+        self.assertEqual(page.get.call_count, 2)
+        self.assertEqual(page.raw_page.wait_for_url.call_count, 2)
+        self.assertTrue(any("重试一次: Page.goto: Timeout 20000ms exceeded." in line for line in logs))
+
+    def test_nsfw_navigation_accepts_goto_error_after_commit_to_grok(self):
+        page = self._stuck_signup_page()
+
+        def commit_then_abort(url, **kwargs):
+            page.url = "https://grok.com/"
+            raise Exception("Page.goto: NS_BINDING_ABORTED")
+
+        page.get.side_effect = commit_then_abort
+        engine._open_grok_for_nsfw(page)
+        page.get.assert_called_once()
+
+    def test_nsfw_navigation_raises_after_second_failure(self):
+        page = self._stuck_signup_page()
+        page.get.side_effect = Exception("Page.goto: Timeout 20000ms exceeded.")
+        with self.assertRaises(Exception):
+            engine._open_grok_for_nsfw(page)
+        self.assertEqual(page.get.call_count, 2)
 
     def test_detects_account_already_registered_notice(self):
         page = mock.Mock()
