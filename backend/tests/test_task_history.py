@@ -142,6 +142,50 @@ class TaskRunStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.list_task_runs("bogus")
 
+    def test_clear_removes_registration_history_even_when_accounts_remain(self):
+        self.store.add_result({
+            "email": "kept@example.com",
+            "status": "success",
+            "batch_id": "web-done",
+            "started_at": "2026-09-28 17:42:00",
+            "finished_at": "2026-09-28 17:44:00",
+        })
+        self.store.add_result({
+            "email": "live@example.com",
+            "status": "success",
+            "batch_id": "web-live",
+            "started_at": "2026-09-28 18:00:00",
+            "finished_at": "2026-09-28 18:02:00",
+        })
+        self.store.upsert_task_run(
+            KIND_REGISTRATION, "web-done", started_at=time.time() - 60, status="finished"
+        )
+        self.store.append_task_logs(
+            KIND_REGISTRATION, "web-done", [(1, "2026-09-28 17:42:07+08:00", "启动")]
+        )
+        self.store.upsert_task_run(
+            KIND_REGISTRATION, "web-live", started_at=time.time(), status="running"
+        )
+        self.store.append_task_logs(
+            KIND_REGISTRATION, "web-live", [(1, "2026-09-28 18:00:00+08:00", "仍在跑")]
+        )
+
+        removed = self.store.clear_task_runs(KIND_REGISTRATION, keep_run_id="web-live")
+        self.assertEqual(removed, 1)
+        items, total = self.store.list_task_runs(KIND_REGISTRATION, limit=50)
+        self.assertEqual(total, 1)
+        self.assertEqual(items[0]["run_id"], "web-live")
+        self.assertIsNone(self.store.get_task_run(KIND_REGISTRATION, "web-done"))
+        self.assertEqual(self.store.count_task_logs(KIND_REGISTRATION, "web-done"), 0)
+        self.assertEqual(self.store.list_results(batch_id="web-done")[0]["email"], "kept@example.com")
+        self.assertEqual(self.store.list_task_runs(KIND_REGISTRATION, keyword="kept@example.com")[1], 0)
+
+        self.assertTrue(self.store.delete_task_run(KIND_REGISTRATION, "web-live"))
+        self.assertEqual(self.store.list_task_runs(KIND_REGISTRATION, limit=50)[1], 0)
+        self.assertIsNone(self.store.get_task_run(KIND_REGISTRATION, "web-live"))
+        self.assertFalse(self.store.delete_task_run(KIND_REGISTRATION, "web-live"))
+        self.assertEqual(len(self.store.list_results(batch_id="web-live")), 1)
+
 
 class TaskRunRecorderTests(unittest.TestCase):
     class _Repo:

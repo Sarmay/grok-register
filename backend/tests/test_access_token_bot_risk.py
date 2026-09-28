@@ -226,5 +226,72 @@ class AccessTokenBotRiskTests(unittest.TestCase):
             self.assertEqual(store.list_results()[0]["bot_risk"], 0)
 
 
+class SsoTokenRetryTests(unittest.TestCase):
+    def _patch(self, device=None, auth=None, browser=None):
+        return (
+            mock.patch.object(auth_exchange, "sso_to_token_device_flow", device or (lambda *a, **k: None)),
+            mock.patch.object(auth_exchange, "sso_to_token_auth_code", auth or (lambda *a, **k: None)),
+            mock.patch.object(auth_exchange, "sso_to_token_device_browser", browser or (lambda *a, **k: None)),
+        )
+
+    def test_each_path_is_retried_once_before_the_next(self):
+        calls = []
+
+        def device(sso, proxy="", log=print):
+            calls.append("device")
+            return None
+
+        def auth(sso, proxy="", log=print):
+            calls.append("auth")
+            if calls.count("auth") == 2:
+                return {"access_token": "tok"}
+            return None
+
+        patches = self._patch(device=device, auth=auth)
+        with patches[0], patches[1], patches[2]:
+            token = auth_exchange.sso_to_token("sso-cookie", log=lambda *_args, **_kwargs: None)
+
+        self.assertEqual(calls, ["device", "device", "auth", "auth"])
+        self.assertEqual(token["access_token"], "tok")
+
+    def test_first_success_does_not_retry_or_fall_back(self):
+        calls = []
+
+        def device(sso, proxy="", log=print):
+            calls.append("device")
+            return {"access_token": "ok"}
+
+        def auth(sso, proxy="", log=print):
+            calls.append("auth")
+            return {"access_token": "other"}
+
+        patches = self._patch(device=device, auth=auth)
+        with patches[0], patches[1], patches[2]:
+            token = auth_exchange.sso_to_token("sso-cookie", log=lambda *_args, **_kwargs: None)
+
+        self.assertEqual(calls, ["device"])
+        self.assertEqual(token["access_token"], "ok")
+
+    def test_auth_code_preference_retries_then_falls_back_to_device(self):
+        calls = []
+
+        def device(sso, proxy="", log=print):
+            calls.append("device")
+            return None
+
+        def auth(sso, proxy="", log=print):
+            calls.append("auth")
+            return None
+
+        patches = self._patch(device=device, auth=auth)
+        with patches[0], patches[1], patches[2]:
+            token = auth_exchange.sso_to_token(
+                "sso-cookie", prefer="auth_code", log=lambda *_args, **_kwargs: None
+            )
+
+        self.assertIsNone(token)
+        self.assertEqual(calls, ["auth", "auth", "device", "device"])
+
+
 if __name__ == "__main__":
     unittest.main()

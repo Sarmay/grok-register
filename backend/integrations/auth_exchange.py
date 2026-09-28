@@ -1095,6 +1095,15 @@ def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print) -> dict 
     return token
 
 
+_TOKEN_METHOD_LABELS = {
+    "device_browser": "浏览器 Device Flow",
+    "device_protocol": "协议 Device Flow",
+    "auth_code": "Authorization Code",
+}
+# 每条路径先试一次，失败后再试一次，然后才换下一条。
+_TOKEN_METHOD_ATTEMPTS = 2
+
+
 def sso_to_token(
     sso_cookie: str,
     proxy: str = "",
@@ -1109,6 +1118,7 @@ def sso_to_token(
       1) 浏览器 Device（有 browser_approve 时）
       2) 纯协议 Device verify/approve
       3) Authorization Code（allow_fallback）
+    每一条失败后都会原样再试一次，仍失败才进入下一条。
     prefer: "device" | "auth_code"
     """
     sso_cookie = str(sso_cookie or "").strip()
@@ -1129,30 +1139,34 @@ def sso_to_token(
         order.append("device_protocol")
         if allow_fallback:
             order.append("auth_code")
-    if not allow_fallback and prefer == "device":
-        # 已按上面构造；若只要单路径且无 browser，仅 protocol
-        pass
+
+    def _exchange_once(method: str) -> dict | None:
+        if method == "device_browser":
+            log("  [*] 尝试浏览器 Device Flow（继续/允许）...")
+            return sso_to_token_device_browser(
+                sso_cookie, browser_approve, proxy=proxy, log=log
+            )
+        if method == "device_protocol":
+            log("  [*] 尝试协议 Device Flow 换 token ...")
+            return sso_to_token_device_flow(sso_cookie, proxy=proxy, log=log)
+        log("  [*] 尝试 Authorization Code 换 token ...")
+        return sso_to_token_auth_code(sso_cookie, proxy=proxy, log=log)
 
     last_label = ""
     for method in order:
-        last_label = method
-        if method == "device_browser":
-            log("  [*] 尝试浏览器 Device Flow（继续/允许）...")
-            token = sso_to_token_device_browser(
-                sso_cookie, browser_approve, proxy=proxy, log=log
-            )
-        elif method == "device_protocol":
-            log("  [*] 尝试协议 Device Flow 换 token ...")
-            token = sso_to_token_device_flow(sso_cookie, proxy=proxy, log=log)
-        else:
-            log("  [*] 尝试 Authorization Code 换 token ...")
-            token = sso_to_token_auth_code(sso_cookie, proxy=proxy, log=log)
-        if token and token.get("access_token"):
-            if method != order[0]:
-                log(f"  ✅ 回退路径 {method} 成功")
-            return token
+        last_label = _TOKEN_METHOD_LABELS.get(method, method)
+        for attempt in range(1, _TOKEN_METHOD_ATTEMPTS + 1):
+            if attempt > 1:
+                log(f"  [*] {last_label} 失败，重试一次 ...")
+            token = _exchange_once(method)
+            if token and token.get("access_token"):
+                if attempt > 1:
+                    log(f"  ✅ {last_label} 重试成功")
+                elif method != order[0]:
+                    log(f"  ✅ 回退路径 {last_label} 成功")
+                return token
         if method != order[-1]:
-            log(f"  ⚠️ {method} 失败，回退下一路径 ...")
+            log(f"  ⚠️ {last_label} 失败，回退下一路径 ...")
     log(f"  ❌ 全部换 token 路径失败（最后尝试 {last_label}）")
     return None
 

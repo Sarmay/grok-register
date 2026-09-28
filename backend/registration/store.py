@@ -327,6 +327,12 @@ class RegistrationRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_task_logs_run
                     ON task_logs(kind, run_id, seq);
+                CREATE TABLE IF NOT EXISTS dismissed_task_runs (
+                    kind TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    dismissed_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (kind, run_id)
+                );
                 """
             )
             conn.execute("PRAGMA user_version = 10")
@@ -1466,6 +1472,10 @@ class RegistrationRepository:
         payload = json.dumps(summary or {}, ensure_ascii=False, default=str)
         with self._connect() as conn:
             conn.execute(
+                "DELETE FROM dismissed_task_runs WHERE kind = ? AND run_id = ?",
+                (kind, key),
+            )
+            conn.execute(
                 """
                 INSERT INTO task_runs (kind, run_id, started_at, finished_at, status, summary_json, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1658,6 +1668,14 @@ class RegistrationRepository:
             "search_text": " ".join([run_id, *emails]).lower(),
         }
 
+    def _dismissed_run_ids(self, conn: sqlite3.Connection, kind: str) -> set[str]:
+        return {
+            str(row["run_id"])
+            for row in conn.execute(
+                "SELECT run_id FROM dismissed_task_runs WHERE kind = ?", (kind,)
+            )
+        }
+
     def list_task_runs(
         self, kind: str, *, keyword: str = "", limit: int = 20, offset: int = 0
     ) -> Tuple[List[Dict[str, Any]], int]:
@@ -1675,9 +1693,11 @@ class RegistrationRepository:
                 ).fetchall()
             }
             batches = self._registration_batches(conn) if kind == TASK_KIND_REGISTRATION else {}
+            dismissed = self._dismissed_run_ids(conn, kind)
         needle = str(keyword or "").strip().lower()
         items: List[Dict[str, Any]] = []
-        for run_id in set(runs) | set(batches):
+        visible = set(runs) | (set(batches) - dismissed)
+        for run_id in visible:
             item = self._task_run_item(kind, run_id, runs.get(run_id), batches.get(run_id), log_counts.get(run_id, 0))
             if needle and needle not in item["search_text"]:
                 continue
@@ -1707,11 +1727,24 @@ class RegistrationRepository:
                 "SELECT COUNT(*) AS total FROM task_logs WHERE kind = ? AND run_id = ?",
                 (kind, key),
             ).fetchone()["total"]
-        if row is None and batch is None:
+            dismissed = key in self._dismissed_run_ids(conn, kind)
+        if row is None and (batch is None or dismissed):
             return None
         item = self._task_run_item(kind, key, dict(row) if row else None, batch, int(log_count or 0))
         item.pop("search_text", None)
         return item
+
+    def _remember_dismissed_runs(
+        self, conn: sqlite3.Connection, kind: str, run_ids: Iterable[str]
+    ) -> None:
+        now = self.now_text()
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO dismissed_task_runs (kind, run_id, dismissed_at)
+            VALUES (?, ?, ?)
+            """,
+            [(kind, run_id, now) for run_id in run_ids if run_id],
+        )
 
     def delete_task_run(self, kind: str, run_id: str) -> bool:
         kind = self._task_kind(kind)
@@ -1719,23 +1752,63 @@ class RegistrationRepository:
         if not key:
             return False
         with self._connect() as conn:
-            runs = conn.execute(
+            has_run = conn.execute(
+                "SELECT 1 FROM task_runs WHERE kind = ? AND run_id = ?", (kind, key)
+            ).fetchone()
+            has_logs = conn.execute(
+                "SELECT 1 FROM task_logs WHERE kind = ? AND run_id = ? LIMIT 1",
+                (kind, key),
+            ).fetchone()
+            has_batch = (
+                key in self._registration_batches(conn, key)
+                if kind == TASK_KIND_REGISTRATION
+                else False
+            )
+            already_dismissed = conn.execute(
+                "SELECT 1 FROM dismissed_task_runs WHERE kind = ? AND run_id = ?",
+                (kind, key),
+            ).fetchone()
+            if already_dismissed and not has_run and not has_logs:
+                return False
+            if not has_run and not has_logs and not has_batch:
+                return False
+            self._remember_dismissed_runs(conn, kind, [key])
+            conn.execute(
                 "DELETE FROM task_runs WHERE kind = ? AND run_id = ?", (kind, key)
-            ).rowcount
-            logs = conn.execute(
+            )
+            conn.execute(
                 "DELETE FROM task_logs WHERE kind = ? AND run_id = ?", (kind, key)
-            ).rowcount
-        return bool(runs or logs)
+            )
+        return True
 
     def clear_task_runs(self, kind: str, *, keep_run_id: str = "") -> int:
         kind = self._task_kind(kind)
         keep = str(keep_run_id or "").strip()
         with self._connect() as conn:
-            runs = conn.execute(
+            run_ids = {
+                str(row["run_id"])
+                for row in conn.execute(
+                    "SELECT run_id FROM task_runs WHERE kind = ?", (kind,)
+                )
+            }
+            run_ids.update(
+                str(row["run_id"])
+                for row in conn.execute(
+                    "SELECT DISTINCT run_id FROM task_logs WHERE kind = ?", (kind,)
+                )
+            )
+            if kind == TASK_KIND_REGISTRATION:
+                run_ids.update(self._registration_batches(conn))
+            run_ids.discard(keep)
+            run_ids.discard("")
+            self._remember_dismissed_runs(conn, kind, run_ids)
+            conn.execute(
                 "DELETE FROM task_runs WHERE kind = ? AND run_id <> ?", (kind, keep)
-            ).rowcount
-            conn.execute("DELETE FROM task_logs WHERE kind = ? AND run_id <> ?", (kind, keep))
-        return int(runs or 0)
+            )
+            conn.execute(
+                "DELETE FROM task_logs WHERE kind = ? AND run_id <> ?", (kind, keep)
+            )
+        return len(run_ids)
 
     def prune_task_runs(self, kind: str, *, keep_days: int = 60, keep_count: int = 200) -> int:
         """删掉过旧或超出条数的已结束任务及其日志。0 表示该维度不限制。"""
