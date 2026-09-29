@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
+import threading
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 
@@ -130,6 +132,62 @@ def redact_proxy_text(value: object) -> str:
     )
 
 
+_STICKY_ACCOUNT_RE = re.compile(r"[^A-Za-z0-9_-]")
+_sticky_proxy = threading.local()
+
+
+def bind_resin_sticky_account(proxy_url: str, account: str) -> str:
+    """把 Resin 粘性账号写进代理用户名。
+
+    正向代理身份是 ``Platform.Account``。用户名里已经有账号时保持原样，
+    避免把手工配置的粘性身份再包一层。
+    """
+    account = _STICKY_ACCOUNT_RE.sub("", str(account or ""))[:48]
+    value = str(proxy_url or "").strip()
+    if not value or not account or "@" not in value:
+        return value
+
+    has_scheme = "://" in value
+    try:
+        parsed = urlsplit(value if has_scheme else f"http://{value}")
+        parsed.port
+    except ValueError:
+        return value
+    if "@" not in parsed.netloc or not parsed.hostname:
+        return value
+
+    userinfo, host = parsed.netloc.rsplit("@", 1)
+    raw_user, sep, raw_pass = userinfo.partition(":")
+    try:
+        username = unquote(raw_user, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return value
+    if not username or "." in username or ":" in username:
+        return value
+
+    sticky_user = f"{raw_user}.{account}"
+    sticky_userinfo = f"{sticky_user}:{raw_pass}" if sep else sticky_user
+    resolved = urlunsplit(
+        (parsed.scheme, f"{sticky_userinfo}@{host}", parsed.path, parsed.query, parsed.fragment)
+    )
+    return resolved if has_scheme else resolved.split("://", 1)[1]
+
+
+def current_sticky_proxy_account() -> str:
+    return str(getattr(_sticky_proxy, "account", "") or "")
+
+
+def begin_sticky_proxy_account() -> str:
+    """为本线程开始一个新的 Resin 粘性账号。"""
+    account = "r" + secrets.token_hex(4)
+    _sticky_proxy.account = account
+    return account
+
+
+def clear_sticky_proxy_account() -> None:
+    _sticky_proxy.account = ""
+
+
 def resolve_proxy_url(proxy_url: str) -> str:
     """Replace a local proxy host with the Docker host alias when configured."""
     value = str(proxy_url or "").strip()
@@ -152,3 +210,11 @@ def resolve_proxy_url(proxy_url: str) -> str:
         (parsed.scheme, f"{auth}{docker_host}{port}", parsed.path, parsed.query, parsed.fragment)
     )
     return resolved if has_scheme else resolved.split("://", 1)[1]
+
+
+def active_proxy_url(proxy_url: str) -> str:
+    """解析 Docker 主机别名，并套用当前线程的 Resin 粘性账号。"""
+    return bind_resin_sticky_account(
+        resolve_proxy_url(proxy_url),
+        current_sticky_proxy_account(),
+    )

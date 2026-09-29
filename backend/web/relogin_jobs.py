@@ -385,6 +385,10 @@ class ReloginJobCoordinator:
 
     def _run_record(self, record: Dict[str, Any], store: Any) -> Dict[str, Any]:
         from backend.automation.session import stop_browser
+        from backend.integrations.proxy import (
+            begin_sticky_proxy_account,
+            clear_sticky_proxy_account,
+        )
         from backend.registration import engine as gr
         from backend.registration.login_flow import (
             InvalidLoginCredentials,
@@ -437,6 +441,8 @@ class ReloginJobCoordinator:
             elif "[CPA]" in text:
                 self._set(stage="重建授权文件")
 
+        sticky_account = begin_sticky_proxy_account()
+        log(f"[代理] 本次重登使用 Resin 粘性账号 {sticky_account}，固定同一出口")
         try:
             gr.load_config()
             gr._wire_runtime_modules()
@@ -551,6 +557,7 @@ class ReloginJobCoordinator:
                 stop_browser(force=True)
             except BaseException:
                 pass
+            clear_sticky_proxy_account()
 
 
 relogin_coordinator = ReloginJobCoordinator()

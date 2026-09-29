@@ -45,7 +45,15 @@ from backend.automation import session as _bs
 from backend.registration import signup_flow as _rf
 from backend.integrations import network_checks as _conn
 from backend.registration.store import RegistrationRepository
-from backend.integrations.proxy import redact_proxy_text, redact_proxy_url, resolve_proxy_url
+from backend.integrations.proxy import (
+    active_proxy_url,
+    begin_sticky_proxy_account,
+    clear_sticky_proxy_account,
+    current_sticky_proxy_account,
+    redact_proxy_text,
+    redact_proxy_url,
+    resolve_proxy_url,
+)
 from backend.shared.paths import DATA_ROOT, PROJECT_ROOT
 from backend.automation.session import (
     browser,
@@ -462,13 +470,21 @@ class RegistrationRiskDenied(Exception):
         self.risk_state = dict(risk_state or {})
 
 
+def _restart_browser_for_fresh_exit(log_callback=None):
+    """风控出口需要换 IP 时，先换 Resin 粘性账号再重启浏览器。"""
+    account = begin_sticky_proxy_account()
+    if log_callback:
+        log_callback(f"[代理] 更换出口，Resin 粘性账号改为 {account}")
+    return restart_browser(log_callback=log_callback)
+
+
 def prepare_registration_exit_ip(log_callback=None) -> str:
     """打开注册页前，在浏览器里识别出口 IP，并尽量避开已风控出口。"""
     return _exit_ip.ensure_unflagged_exit_ip(
         store=get_registration_repository(),
         proxy_enabled=bool(get_proxies()),
         log_callback=log_callback,
-        restart=lambda: restart_browser(log_callback=log_callback),
+        restart=lambda: _restart_browser_for_fresh_exit(log_callback),
     )
 
 
@@ -928,10 +944,21 @@ DUCKMAIL_API_BASE_DEFAULT = duckmail_provider.API_BASE_DEFAULT
 
 
 def get_proxies():
-    proxy = resolve_proxy_url(config.get("proxy", ""))
+    proxy = active_proxy_url(config.get("proxy", ""))
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+def _announce_attempt_proxy(log_callback, *, fresh: bool) -> str:
+    """每个注册号使用独立的 Resin 粘性账号，让这一号的连接走同一个出口。"""
+    if fresh or not current_sticky_proxy_account():
+        account = begin_sticky_proxy_account()
+    else:
+        account = current_sticky_proxy_account()
+    if log_callback and account:
+        log_callback(f"[代理] 本号使用 Resin 粘性账号 {account}，本次注册固定同一出口")
+    return account
 
 
 def reset_network_route_logs():
@@ -1630,7 +1657,7 @@ def _normalize_sso_token(raw_token):
 
 def _resolve_cpa_proxy():
     """CPA 换 token 用的代理：优先 config.proxy，其次环境变量，否则直连。"""
-    proxy = resolve_proxy_url(config.get("proxy", ""))
+    proxy = active_proxy_url(config.get("proxy", ""))
     if proxy:
         return proxy
     for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
@@ -3420,6 +3447,7 @@ def run_registration(count):
             local_fail_stats = empty_fail_stats()
             try:
                 boot_started_at = time.time()
+                begin_sticky_proxy_account()
                 try:
                     start_browser(
                         log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
@@ -3448,6 +3476,10 @@ def run_registration(count):
                 i = 0
                 retry = 0
                 while i < n and not controller.should_stop():
+                    _announce_attempt_proxy(
+                        lambda m: registration_log(f"[W{wid+1}] {m}"),
+                        fresh=i > 0,
+                    )
                     attempt_started_at = time.time()
                     email = ""
                     profile = {}
@@ -3727,6 +3759,7 @@ def run_registration(count):
                             except Exception:
                                 pass
             finally:
+                clear_sticky_proxy_account()
                 try:
                     maybe_stop_browser(
                         user_stopped=bool(controller.should_stop()),
@@ -3759,6 +3792,7 @@ def run_registration(count):
 
     try:
         boot_started_at = time.time()
+        begin_sticky_proxy_account()
         try:
             start_browser(log_callback=registration_log, cancel_callback=controller.should_stop)
         except Exception as boot_exc:
@@ -3786,6 +3820,7 @@ def run_registration(count):
             if controller.should_stop():
                 break
             registration_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+            _announce_attempt_proxy(registration_log, fresh=i > 0)
             attempt_started_at = time.time()
             email = ""
             profile = {}
@@ -4120,6 +4155,7 @@ def run_registration(count):
     except Exception as exc:
         registration_log(f"[!] 任务异常: {exc}")
     finally:
+        clear_sticky_proxy_account()
         try:
             user_stopped = bool(controller.should_stop())
             if user_stopped:
