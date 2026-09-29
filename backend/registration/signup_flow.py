@@ -1692,7 +1692,7 @@ def _reject_turnstile(exc: BaseException) -> NoReturn:
     """资料页 Turnstile 失效后直接换浏览器出口重试。
 
     刷新资料页只会回到注册首页，要从选邮箱重新走，不如直接重启浏览器更换出口；
-    MailNest 已扣费的邮箱会进入复用队列，下一轮继续使用。
+    MailNest 已扣费的邮箱只再给一轮，下一轮继续使用。
     """
     err = _AccountRetryNeeded(f"Turnstile 组件失效（{exc}），重启浏览器更换出口后重试")
     setattr(err, "single_retry", True)

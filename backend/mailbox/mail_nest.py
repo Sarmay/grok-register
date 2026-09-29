@@ -1,10 +1,12 @@
 """MailNest 邮箱渠道适配器。
 
-临时邮箱购买时只冻结金额。第一次成功收件才扣费，之后在 expired_at 前
-还可以继续收信。未收到验证码时应调用释放接口，把冻结金额退回。
+临时邮箱购买时只冻结金额，大约 20 分钟内有效。第一次成功收件才扣费。
+没收到验证码时调用释放接口，把冻结金额退回并换邮箱。
+已经收到验证码但注册没成功，并且离过期还超过 3 分钟，只再给一轮。
+这一轮再失败，包括没收到新验证码或验证码被限流，就丢掉。
 
 订单池默认只在内存里。bind_store() 挂上仓储后，每次变更都会落盘；
-进程重启后 hydrate() 能把已扣费的邮箱找回来继续复用，没扣费的交给调用方释放退款。
+进程重启后 hydrate() 能把还没用完这一轮的已扣费邮箱找回来。
 """
 
 from __future__ import annotations
@@ -21,9 +23,6 @@ from backend.mailbox.utilities import extract_verification_code
 API_BASE = "https://mailnest.top"
 DEFAULT_PROJECT_CODE = "x-ai001"
 REUSE_MARGIN_SECONDS = 180
-# xAI 对同一地址的验证码请求会限流，页面写 “a few minutes”，实际可超过 30 分钟。
-# 刚收过验证码的地址会主动等满这段时间再复用；否则下一次索码几乎必定被拒，白白浪费一次尝试。
-CODE_RATE_COOLDOWN_SECONDS = 60 * 60
 ALREADY_CHARGED = "D0004"
 # MailNest 返回的时间不带时区，实际是北京时间，例如买号时的 "2026-09-23 18:40:44"。
 API_TIMEZONE = timezone(timedelta(hours=8))
@@ -53,11 +52,13 @@ class MailOrder:
     expired_at: float = 0.0
     expired_at_text: str = ""
     code_received: bool = False
+    # 收到验证码后只再给一轮。置位表示这一轮已经发出，再失败就丢掉。
+    retry_used: bool = False
     sso_timeout_reused: bool = False
     used_codes: set[str] = field(default_factory=set)
     # MailNest 返回的收件时间，只用来跳过已经用过的邮件。
     last_received_at: float = 0.0
-    # 本机时钟：最近一次拿到验证码或被 MailNest 判定扣费的时间，决定复用冷却。
+    # 本机时钟：最近一次拿到验证码或被 MailNest 判定扣费的时间。
     last_code_at: float = 0.0
     code_rate_limited_until: float = 0.0
 
@@ -72,16 +73,6 @@ class MailOrder:
         current = time.time() if now is None else now
         return self.expired_at - current > margin
 
-    def ready_at(self, now: Optional[float] = None) -> float:
-        """最早可以再次向这个地址索取验证码的时间。
-
-        刚收过验证码的地址至少等满 CODE_RATE_COOLDOWN_SECONDS；被 xAI 明确限流过的
-        再看 code_rate_limited_until。两者取晚的那个。
-        """
-        current = time.time() if now is None else now
-        cooldown_until = (self.last_code_at + CODE_RATE_COOLDOWN_SECONDS) if self.last_code_at else 0.0
-        return max(current, cooldown_until, float(self.code_rate_limited_until or 0.0))
-
     def to_payload(self, state: str) -> dict:
         return {
             "email": self.email,
@@ -90,6 +81,7 @@ class MailOrder:
             "expired_at": float(self.expired_at or 0.0),
             "expired_at_text": self.expired_at_text,
             "code_received": bool(self.code_received),
+            "retry_used": bool(self.retry_used),
             "sso_timeout_reused": bool(self.sso_timeout_reused),
             "used_codes": sorted(self.used_codes),
             "last_received_at": float(self.last_received_at or 0.0),
@@ -114,6 +106,7 @@ class MailOrder:
             expired_at=expired_at,
             expired_at_text=expired_at_text,
             code_received=bool(payload.get("code_received")),
+            retry_used=bool(payload.get("retry_used") or payload.get("sso_timeout_reused")),
             sso_timeout_reused=bool(payload.get("sso_timeout_reused")),
             used_codes={str(item) for item in codes if str(item)},
             last_received_at=float(payload.get("last_received_at") or 0.0),
@@ -213,10 +206,13 @@ def hydrate() -> HydrateResult:
                 _inflight[key] = order
                 result.stale.append(order)
                 continue
-            if not order.reusable(order.ready_at(now)):
+            if not order.reusable(now):
                 _forget(key)
                 continue
+            # 重启后剩下来的已扣费邮箱就是那一轮重试，不能再往后发一次。
+            order.retry_used = True
             _available[key] = order
+            _persist(order, STATE_AVAILABLE)
             result.restored.append(order)
     return result
 
@@ -269,6 +265,12 @@ def get_order(email: str) -> Optional[MailOrder]:
         return _inflight.get(key) or _available.get(key)
 
 
+def is_inflight(email: str) -> bool:
+    key = str(email or "").strip()
+    with _pool_lock:
+        return key in _inflight
+
+
 def code_was_received(email: str) -> bool:
     order = get_order(email)
     return bool(order and order.code_received)
@@ -310,7 +312,7 @@ def mark_charged(email: str) -> None:
 
 
 def claim_reusable(blocked: Optional[BlockedEmail] = None, now: Optional[float] = None) -> Optional[MailOrder]:
-    """取出一个已扣费、冷却结束且离过期还超过 3 分钟的邮箱。"""
+    """取出一个已扣费、还没用完额外一轮、且离过期超过 3 分钟的邮箱。"""
     current = time.time() if now is None else now
     with _pool_lock:
         for email in list(_available):
@@ -320,11 +322,8 @@ def claim_reusable(blocked: Optional[BlockedEmail] = None, now: Optional[float] 
             if blocked and blocked(email):
                 _discard_locked(email)
                 continue
-            ready_at = order.ready_at(current)
-            if not order.reusable(ready_at):
+            if not order.reusable(current):
                 _discard_locked(email)
-                continue
-            if current < ready_at:
                 continue
             _available.pop(email, None)
             _inflight[email] = order
@@ -345,20 +344,20 @@ def drop_order(email: str) -> None:
 
 
 def recycle_order(email: str, *, reason: str = "", now: Optional[float] = None) -> bool:
-    """扣费后的邮箱放回队列。
+    """扣费后的邮箱放回队列，只给一轮，而且马上可以取走。
 
-    刚收过验证码的地址先按冷却时间排队，冷却结束前不会被 claim_reusable 取走。
-    冷却结束时已经不够 3 分钟余量，或者尚未扣费，则不复用。
+    已经发过这一轮、当前不够 3 分钟余量，或者尚未扣费，则不复用。
     """
     key = str(email or "").strip()
     current = time.time() if now is None else now
     with _pool_lock:
         order = _inflight.get(key) or _available.get(key)
-        if order is None or not order.reusable(order.ready_at(current)):
+        if order is None or order.retry_used or not order.reusable(current):
             _discard_locked(key)
             if active_email() == key:
                 _remember_active("")
             return False
+        order.retry_used = True
         if reason == "sso_timeout":
             order.sso_timeout_reused = True
         _inflight.pop(key, None)
@@ -369,35 +368,8 @@ def recycle_order(email: str, *, reason: str = "", now: Optional[float] = None) 
     return True
 
 
-def park_code_rate_limit(
-    email: str,
-    cooldown: int = CODE_RATE_COOLDOWN_SECONDS,
-    now: Optional[float] = None,
-) -> bool:
-    """验证码被限流后进入冷却。冷却结束仍未过期才继续复用。"""
-    key = str(email or "").strip()
-    current = time.time() if now is None else now
-    wait = max(int(cooldown or 0), 0)
-    with _pool_lock:
-        order = _inflight.get(key) or _available.get(key)
-        if order is None:
-            return False
-        order.code_rate_limited_until = max(order.code_rate_limited_until, current + wait)
-        if not order.reusable(order.code_rate_limited_until):
-            _discard_locked(key)
-            if active_email() == key:
-                _remember_active("")
-            return False
-        _inflight.pop(key, None)
-        _available[key] = order
-        _persist(order, STATE_AVAILABLE)
-    if active_email() == key:
-        _remember_active("")
-    return True
-
-
 def prepare_sso_timeout_retry(email: str, now: Optional[float] = None) -> bool:
-    """同一个已扣费邮箱只因 SSO 超时再试一次。"""
+    """同一个已扣费邮箱只因 SSO 超时再试一次。这一轮用掉后不再另给。"""
     key = str(email or "").strip()
     current = time.time() if now is None else now
     with _pool_lock:
@@ -405,10 +377,12 @@ def prepare_sso_timeout_retry(email: str, now: Optional[float] = None) -> bool:
         if (
             order is None
             or not order.code_received
+            or order.retry_used
             or order.sso_timeout_reused
             or not order.reusable(current)
         ):
             return False
+        order.retry_used = True
         order.sso_timeout_reused = True
         _inflight.pop(key, None)
         _available[key] = order

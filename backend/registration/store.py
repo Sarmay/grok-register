@@ -294,6 +294,7 @@ class RegistrationRepository:
                     expired_at REAL NOT NULL DEFAULT 0,
                     expired_at_text TEXT NOT NULL DEFAULT '',
                     code_received INTEGER NOT NULL DEFAULT 0,
+                    retry_used INTEGER NOT NULL DEFAULT 0,
                     sso_timeout_reused INTEGER NOT NULL DEFAULT 0,
                     used_codes TEXT NOT NULL DEFAULT '[]',
                     last_received_at REAL NOT NULL DEFAULT 0,
@@ -335,7 +336,22 @@ class RegistrationRepository:
                 );
                 """
             )
-            conn.execute("PRAGMA user_version = 10")
+            order_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(mailnest_orders)").fetchall()
+            }
+            if "retry_used" not in order_columns:
+                conn.execute(
+                    "ALTER TABLE mailnest_orders ADD COLUMN retry_used INTEGER NOT NULL DEFAULT 0"
+                )
+            conn.execute(
+                """
+                UPDATE mailnest_orders
+                SET retry_used = 1
+                WHERE sso_timeout_reused = 1 AND retry_used = 0
+                """
+            )
+            conn.execute("PRAGMA user_version = 11")
 
     def add_result(self, record: Dict[str, Any]) -> int:
         now = self.now_text()
@@ -1898,9 +1914,9 @@ class RegistrationRepository:
                 """
                 INSERT OR REPLACE INTO mailnest_orders (
                     email, order_id, state, expired_at, expired_at_text, code_received,
-                    sso_timeout_reused, used_codes, last_received_at, last_code_at,
+                    retry_used, sso_timeout_reused, used_codes, last_received_at, last_code_at,
                     code_rate_limited_until, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     email,
@@ -1909,6 +1925,7 @@ class RegistrationRepository:
                     float(payload.get("expired_at") or 0.0),
                     str(payload.get("expired_at_text") or ""),
                     1 if payload.get("code_received") else 0,
+                    1 if payload.get("retry_used") else 0,
                     1 if payload.get("sso_timeout_reused") else 0,
                     json.dumps(sorted(str(item) for item in codes), ensure_ascii=False),
                     float(payload.get("last_received_at") or 0.0),

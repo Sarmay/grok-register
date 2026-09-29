@@ -1146,7 +1146,7 @@ def prepare_mailnest_pool(log_callback=None) -> None:
     if result.restored:
         _mailnest_log(
             log_callback,
-            f"[*] MailNest 找回 {len(result.restored)} 个已扣费邮箱，冷却结束后继续复用",
+            f"[*] MailNest 找回 {len(result.restored)} 个已扣费邮箱，下一轮继续使用",
         )
     for order in result.stale:
         _mailnest_log(log_callback, f"[*] MailNest 上次没用完的邮箱，尝试释放退回冻结: {order.email}")
@@ -1204,9 +1204,10 @@ def _mailnest_release(email: str, log_callback=None) -> str:
 
 
 def settle_mailnest_email(email, exc=None, *, sso="", failure_type="", log_callback=None) -> str:
-    """失败后释放未扣费邮箱，或把已扣费邮箱放回 20 分钟复用队列。
+    """失败后释放未扣费邮箱。已扣费且还没再用过的，只放回一轮。
 
     SSO 超时且邮箱仍有余量时返回 retry_same，调用方应再试一次而不记失败。
+    这一轮也占用唯一的额外机会。
     """
     if not _using_mailnest():
         return "ignored"
@@ -1224,7 +1225,7 @@ def settle_mailnest_email(email, exc=None, *, sso="", failure_type="", log_callb
         mailnest_provider.drop_order(address)
         return "discarded"
     if isinstance(exc, EmailCodeRateLimited) or looks_like_email_code_rate_limit(str(exc or "")):
-        return _cool_mailnest_after_code_rate_limit(address, log_callback)
+        return _drop_mailnest_after_code_rate_limit(address, log_callback)
     kind = failure_type or (classify_failure(exc) if exc is not None else "")
     if kind == FAIL_SSO and mailnest_provider.prepare_sso_timeout_retry(address):
         _mailnest_log(log_callback, f"[!] SSO 超时，同一 MailNest 邮箱再试一次: {address}")
@@ -1234,6 +1235,13 @@ def settle_mailnest_email(email, exc=None, *, sso="", failure_type="", log_callb
         _mailnest_log(log_callback, f"[*] MailNest 邮箱不再复用: {address}")
         return "discarded"
     if mailnest_provider.code_was_received(address):
+        order = mailnest_provider.get_order(address)
+        if order is not None and order.retry_used:
+            if not mailnest_provider.is_inflight(address):
+                return "reused"
+            mailnest_provider.drop_order(address)
+            _mailnest_log(log_callback, f"[*] MailNest 邮箱已经再试过一次，不再复用: {address}")
+            return "discarded"
         if mailnest_provider.recycle_order(address, reason=kind):
             _mailnest_log(log_callback, f"[*] MailNest 验证码已扣费，下一轮继续使用: {address}")
             return "reused"
@@ -1242,22 +1250,26 @@ def settle_mailnest_email(email, exc=None, *, sso="", failure_type="", log_callb
     return _mailnest_release(address, log_callback)
 
 
-def _cool_mailnest_after_code_rate_limit(email: str, log_callback=None) -> str:
-    """已扣费邮箱先冷却，避免下一轮立刻再打到 xAI 的验证码频率限制。"""
+def _drop_mailnest_after_code_rate_limit(email: str, log_callback=None) -> str:
+    """验证码被限流就换邮箱。还没扣费的先释放退款，已扣费的不再复用。"""
     address = str(email or "").strip()
     if not mailnest_provider.code_was_received(address):
-        action = _mailnest_release(address, log_callback)
-        if action != "reused":
-            return action
-    if mailnest_provider.park_code_rate_limit(address):
-        minutes = max(mailnest_provider.CODE_RATE_COOLDOWN_SECONDS // 60, 1)
-        _mailnest_log(
-            log_callback,
-            f"[*] MailNest 验证码请求过多，{minutes} 分钟内不再复用: {address}",
-        )
-        return "cooled"
+        try:
+            result = mailnest_provider.release_email(http_post, get_mailnest_api_key(), address)
+        except Exception as exc:
+            mailnest_provider.drop_order(address)
+            _mailnest_log(log_callback, f"[!] MailNest 释放邮箱失败: {address}: {exc}")
+            return "discarded"
+        if result == "released":
+            mailnest_provider.drop_order(address)
+            _mailnest_log(log_callback, f"[*] MailNest 未收到验证码，已释放并退回冻结: {address}")
+            return "released"
+        if result != "charged":
+            mailnest_provider.drop_order(address)
+            _mailnest_log(log_callback, f"[!] MailNest 释放邮箱未成功: {address}")
+            return "discarded"
     mailnest_provider.drop_order(address)
-    _mailnest_log(log_callback, f"[*] MailNest 验证码请求过多且剩余时间不足，不再复用: {address}")
+    _mailnest_log(log_callback, f"[*] MailNest 验证码请求过多，不再复用: {address}")
     return "discarded"
 
 
