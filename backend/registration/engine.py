@@ -470,12 +470,13 @@ class RegistrationRiskDenied(Exception):
         self.risk_state = dict(risk_state or {})
 
 
-def _restart_browser_for_fresh_exit(log_callback=None):
-    """风控出口需要换 IP 时，先换 Resin 粘性账号再重启浏览器。"""
+def _restart_browser_for_fresh_exit(log_callback=None, cancel_callback=None, *, reason=""):
+    """先换 Resin 粘性账号，再重启浏览器，从而拿到新的出口 IP。"""
     account = begin_sticky_proxy_account()
     if log_callback:
-        log_callback(f"[代理] 更换出口，Resin 粘性账号改为 {account}")
-    return restart_browser(log_callback=log_callback)
+        prefix = f"{reason}，" if reason else ""
+        log_callback(f"[代理] {prefix}更换出口，Resin 粘性账号改为 {account}")
+    return restart_browser(log_callback=log_callback, cancel_callback=cancel_callback)
 
 
 def prepare_registration_exit_ip(log_callback=None) -> str:
@@ -484,7 +485,7 @@ def prepare_registration_exit_ip(log_callback=None) -> str:
         store=get_registration_repository(),
         proxy_enabled=bool(get_proxies()),
         log_callback=log_callback,
-        restart=lambda: _restart_browser_for_fresh_exit(log_callback),
+        restart=lambda: _restart_browser_for_fresh_exit(log_callback, reason="风控出口"),
     )
 
 
@@ -3898,8 +3899,12 @@ def run_registration(count):
                                 failure_reason=str(mail_exc),
                                 extra={"邮箱已更换重试": True, "邮箱尝试次数": mail_try},
                             )
-                            registration_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                            restart_browser(log_callback=registration_log, cancel_callback=controller.should_stop)
+                            registration_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱并更换出口重试: {msg}")
+                            _restart_browser_for_fresh_exit(
+                                registration_log,
+                                controller.should_stop,
+                                reason="验证码超时",
+                            )
                             sleep_with_cancel(1, controller.should_stop)
                             continue
                         raise
