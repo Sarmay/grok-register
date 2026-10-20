@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -31,15 +32,20 @@ SCOPES = "openid profile email offline_access grok-cli:access api:access"
 
 # --- Device Flow 常量（主路径，对齐 CPA internal/auth/xai） --------------------
 DEVICE_CODE_URL = f"{OIDC_ISSUER}/oauth2/device/code"
+DEVICE_DISCOVERY_URL = f"{OIDC_ISSUER}/.well-known/openid-configuration"
 DEVICE_VERIFY_URL = f"{OIDC_ISSUER}/oauth2/device/verify"
 DEVICE_APPROVE_URL = f"{OIDC_ISSUER}/oauth2/device/approve"
 DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 DEVICE_DEFAULT_INTERVAL = 5
 DEVICE_DEFAULT_EXPIRES = 1800
 DEVICE_POLL_CAP_SECONDS = 90
+# 浏览器授权与 token 轮询并行，单次尝试的上限。协议路径仍用 DEVICE_POLL_CAP_SECONDS。
+DEVICE_BROWSER_TIMEOUT_SECONDS = 180
 # 浏览器点完「允许」后，服务端落库可能有延迟；协议路径 approve 多半无效，快速回退
 DEVICE_GRACE_BROWSER = 60
 DEVICE_GRACE_PROTOCOL = 10
+_SSO_PROBE_ATTEMPTS = 3
+_DEVICE_HTTP_RETRIES = 3
 
 # --- Authorization Code Flow 常量（回退路径） --------------------------------
 # authorize 必须注入 referrer=grok-build，否则 access_token 无该 claim，
@@ -491,40 +497,160 @@ def _device_authorized(url: str = "", body: str = "") -> bool:
     return any(m in b for m in markers)
 
 
+def _is_transient_device_error(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    if _is_transient_tls_error(exc):
+        return True
+    return any(
+        needle in text
+        for needle in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "temporarily unavailable",
+            "remote end closed",
+            "bad gateway",
+            "unexpected eof",
+        )
+    )
+
+
+def _device_http_opener(proxy: str = ""):
+    handlers = [urllib.request.ProxyHandler({})]
+    if proxy:
+        handlers[0] = urllib.request.ProxyHandler(
+            {"http": proxy, "https": proxy}
+        )
+    return urllib.request.build_opener(*handlers)
+
+
+def _device_http_request(
+    method: str,
+    url: str,
+    *,
+    form: dict | None = None,
+    proxy: str = "",
+    timeout: float = 20,
+) -> tuple[int, dict | str, str]:
+    data = None
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "grok-register-cpa/1.0",
+    }
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    opener = _device_http_opener(proxy)
+    try:
+        with opener.open(request, timeout=float(timeout)) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        body = exc.read().decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(body)
+    except Exception:
+        payload = body
+    return status, payload, body
+
+
+def _discover_device_endpoints(proxy: str = "", log=print) -> dict[str, str]:
+    """读取 xAI OIDC discovery；失败时回退到当前已知端点。"""
+    fallback = {
+        "device_authorization_endpoint": DEVICE_CODE_URL,
+        "token_endpoint": f"{OIDC_ISSUER}/oauth2/token",
+    }
+    last_error: BaseException | None = None
+    for attempt in range(1, _DEVICE_HTTP_RETRIES + 1):
+        try:
+            status, payload, body = _device_http_request(
+                "GET",
+                DEVICE_DISCOVERY_URL,
+                proxy=proxy,
+                timeout=15,
+            )
+            if status < 200 or status >= 300 or not isinstance(payload, dict):
+                raise RuntimeError(f"discovery HTTP {status}: {body[:160]}")
+            device_endpoint = str(
+                payload.get("device_authorization_endpoint") or ""
+            ).strip()
+            token_endpoint = str(payload.get("token_endpoint") or "").strip()
+            if not _is_trusted_xai_url(device_endpoint):
+                raise RuntimeError("discovery device endpoint 不受信")
+            if not _is_trusted_xai_url(token_endpoint):
+                raise RuntimeError("discovery token endpoint 不受信")
+            return {
+                "device_authorization_endpoint": device_endpoint,
+                "token_endpoint": token_endpoint,
+            }
+        except Exception as exc:
+            last_error = exc
+            if attempt < _DEVICE_HTTP_RETRIES and _is_transient_device_error(exc):
+                log(f"  ⚠️ OIDC discovery 网络抖动，重试 {attempt + 1}/{_DEVICE_HTTP_RETRIES}: {exc}")
+                time.sleep(float(attempt))
+                continue
+            break
+    if last_error is not None:
+        log(f"  ⚠️ OIDC discovery 失败，使用已知端点: {last_error}")
+    return fallback
+
+
 def request_device_code(proxy: str = "", log=print, session=None) -> dict | None:
     """申请 device_code / user_code（对齐 CPA；可不带 SSO）。"""
+    endpoints = _discover_device_endpoints(proxy=proxy, log=log)
+    device_endpoint = endpoints["device_authorization_endpoint"]
     s = session
     own = False
     if s is None:
         own = True
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        s = requests.Session()
-        if proxies:
-            s.proxies = proxies
+        s = None
     try:
         log("  🔑 Device Flow: 申请 device_code / user_code ...")
-        try:
-            r = s.post(
-                DEVICE_CODE_URL,
-                data={"client_id": CLIENT_ID, "scope": SCOPES},
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                    "User-Agent": DEFAULT_UA,
-                },
-                impersonate="chrome",
-                timeout=20,
-            )
-        except Exception as e:
-            log(f"  ❌ device/code 异常: {e}")
-            return None
-        if r.status_code < 200 or r.status_code >= 300:
-            log(f"  ❌ device/code HTTP {r.status_code}: {str(r.text)[:200]}")
-            return None
-        try:
-            device = r.json()
-        except Exception:
-            log(f"  ❌ device/code 非 JSON: {str(r.text)[:200]}")
+        if s is None:
+            try:
+                status, device, body = _device_http_request(
+                    "POST",
+                    device_endpoint,
+                    form={"client_id": CLIENT_ID, "scope": SCOPES},
+                    proxy=proxy,
+                    timeout=20,
+                )
+            except Exception as exc:
+                log(f"  ❌ device/code 异常: {exc}")
+                return None
+            if status < 200 or status >= 300:
+                log(f"  ❌ device/code HTTP {status}: {body[:200]}")
+                return None
+        else:
+            try:
+                response = s.post(
+                    device_endpoint,
+                    data={"client_id": CLIENT_ID, "scope": SCOPES},
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Accept": "application/json",
+                        "User-Agent": DEFAULT_UA,
+                    },
+                    impersonate="chrome",
+                    timeout=20,
+                )
+            except Exception as exc:
+                log(f"  ❌ device/code 异常: {exc}")
+                return None
+            status = int(getattr(response, "status_code", 0) or 0)
+            body = str(getattr(response, "text", "") or "")
+            try:
+                device = response.json()
+            except Exception:
+                device = body
+            if status < 200 or status >= 300:
+                log(f"  ❌ device/code HTTP {status}: {body[:200]}")
+                return None
+        if not isinstance(device, dict):
+            log(f"  ❌ device/code 非 JSON: {body[:200]}")
             return None
         device_code = str(device.get("device_code") or "").strip()
         user_code = str(device.get("user_code") or "").strip()
@@ -547,11 +673,13 @@ def request_device_code(proxy: str = "", log=print, session=None) -> dict | None
         verification_uri = str(
             device.get("verification_uri") or device.get("verification_url") or ""
         ).strip()
-        open_url = verification_complete or (
-            f"{verification_uri}?user_code={urllib.parse.quote(user_code)}"
-            if verification_uri
-            else f"https://accounts.x.ai/oauth2/device?user_code={urllib.parse.quote(user_code)}"
-        )
+        if verification_complete:
+            open_url = verification_complete
+        elif verification_uri:
+            separator = "&" if "?" in verification_uri else "?"
+            open_url = f"{verification_uri}{separator}user_code={urllib.parse.quote(user_code)}"
+        else:
+            open_url = f"https://accounts.x.ai/oauth2/device?user_code={urllib.parse.quote(user_code)}"
         log(f"  [*] user_code={user_code} interval={interval}s expires_in={expires_in}s")
         return {
             "device_code": device_code,
@@ -561,13 +689,77 @@ def request_device_code(proxy: str = "", log=print, session=None) -> dict | None
             "verification_uri": verification_uri,
             "verification_uri_complete": verification_complete,
             "open_url": open_url,
+            "device_authorization_endpoint": device_endpoint,
+            "token_endpoint": endpoints["token_endpoint"],
         }
     finally:
-        if own:
+        if own and s is not None:
             try:
                 s.close()
             except Exception:
                 pass
+
+
+def _device_poll_limit(expires_in: int, max_wait: float | None = None) -> float:
+    """协议路径默认最多等 DEVICE_POLL_CAP_SECONDS；浏览器路径传入更大的 max_wait。"""
+    expires = max(30, int(expires_in or DEVICE_DEFAULT_EXPIRES))
+    cap = DEVICE_POLL_CAP_SECONDS if max_wait is None else max(1.0, float(max_wait))
+    return float(min(expires, cap))
+
+
+def _wait_or_stop(seconds: float, stop_event=None) -> bool:
+    """等待 seconds 秒。stop_event 被设置时返回 False。"""
+    deadline = time.time() + max(float(seconds), 0.0)
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        time.sleep(min(0.2, max(deadline - time.time(), 0.0)))
+    return not (stop_event is not None and stop_event.is_set())
+
+
+def _is_transient_tls_error(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    needles = (
+        "tls connect error",
+        "openssl_internal",
+        "invalid library",
+        "curl: (35)",
+        "openssl",
+        "handshake",
+        "unexpected_eof",
+    )
+    return any(needle in text for needle in needles)
+
+
+def _probe_sso_session(sso_cookie: str, proxy: str = "", log=print) -> bool:
+    """带 SSO 访问 accounts.x.ai。TLS 握手抖动时换新会话再试。"""
+    last_error: BaseException | None = None
+    for attempt in range(1, _SSO_PROBE_ATTEMPTS + 1):
+        session = _new_sso_session(sso_cookie, proxy=proxy)
+        try:
+            response = session.get("https://accounts.x.ai/", impersonate="chrome", timeout=15)
+            final = str(getattr(response, "url", "") or "")
+            status = int(getattr(response, "status_code", 0) or 0)
+            if "sign-in" in final or "sign-up" in final or status == 401:
+                log("  ❌ sso 无效")
+                return False
+            log("  ✅ sso 有效（浏览器 Device 授权路径）")
+            return True
+        except Exception as exc:
+            last_error = exc
+            if attempt < _SSO_PROBE_ATTEMPTS and _is_transient_tls_error(exc):
+                log(f"  ⚠️ SSO 检查网络抖动，重试一次: {exc}")
+                time.sleep(1)
+                continue
+            log(f"  ❌ 网络错误: {exc}")
+            return False
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+    log(f"  ❌ 网络错误: {last_error}")
+    return False
 
 
 def poll_device_token(
@@ -578,68 +770,90 @@ def poll_device_token(
     log=print,
     session=None,
     grace_invalid_grant: float = 0.0,
+    max_wait: float | None = None,
+    stop_event=None,
+    token_endpoint: str = "",
 ) -> dict | None:
     """轮询 device_code → access/refresh token。
 
     grace_invalid_grant: x.ai 在设备尚未授权时返回 invalid_grant（而非 RFC 8628
     的 authorization_pending）。该秒数内把 invalid_grant 当作 pending 继续轮询，
     超出后才判为终态。浏览器授权路径应传较大值，纯协议路径传较小值以快速回退。
+    max_wait: 覆盖默认 90 秒上限。浏览器路径与页面授权循环共用更长的窗口。
+    stop_event: 置位后结束轮询。拿到 token 时也会置位，用来放开浏览器循环。
+    token_endpoint: discovery 返回的 token endpoint；不传时使用默认 xAI endpoint。
     """
     device_code = str(device_code or "").strip()
     if not device_code:
         log("  ❌ device_code 为空")
         return None
     s = session
-    own = False
-    if s is None:
-        own = True
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        s = requests.Session()
-        if proxies:
-            s.proxies = proxies
+    endpoint = str(token_endpoint or f"{OIDC_ISSUER}/oauth2/token").strip()
+    if not _is_trusted_xai_url(endpoint):
+        log(f"  ⚠️ token endpoint 不受信，使用默认端点: {endpoint[:120]}")
+        endpoint = f"{OIDC_ISSUER}/oauth2/token"
     try:
         interval = max(1, int(interval or DEVICE_DEFAULT_INTERVAL))
         expires_in = max(30, int(expires_in or DEVICE_DEFAULT_EXPIRES))
         log("  [*] Device Flow: 轮询 access/refresh token ...")
         started_at = time.time()
-        poll_deadline = started_at + min(expires_in, DEVICE_POLL_CAP_SECONDS)
+        poll_deadline = started_at + _device_poll_limit(expires_in, max_wait)
         try:
             grace_deadline = started_at + max(0.0, float(grace_invalid_grant or 0.0))
         except Exception:
             grace_deadline = started_at
         last_err = ""
         while time.time() < poll_deadline:
+            if stop_event is not None and stop_event.is_set():
+                log("  [*] Device Flow 轮询已停止")
+                return None
             try:
-                r = s.post(
-                    f"{OIDC_ISSUER}/oauth2/token",
-                    data={
-                        "grant_type": DEVICE_CODE_GRANT_TYPE,
-                        "device_code": device_code,
-                        "client_id": CLIENT_ID,
-                    },
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Accept": "application/json",
-                        "User-Agent": GROK_TOKEN_UA,
-                        "X-Grok-Client-Version": GROK_VERSION,
-                    },
-                    impersonate="chrome",
-                    timeout=20,
-                )
+                if s is None:
+                    status, payload, response_text = _device_http_request(
+                        "POST",
+                        endpoint,
+                        form={
+                            "grant_type": DEVICE_CODE_GRANT_TYPE,
+                            "device_code": device_code,
+                            "client_id": CLIENT_ID,
+                        },
+                        proxy=proxy,
+                        timeout=20,
+                    )
+                else:
+                    response = s.post(
+                        endpoint,
+                        data={
+                            "grant_type": DEVICE_CODE_GRANT_TYPE,
+                            "device_code": device_code,
+                            "client_id": CLIENT_ID,
+                        },
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Accept": "application/json",
+                            "User-Agent": GROK_TOKEN_UA,
+                            "X-Grok-Client-Version": GROK_VERSION,
+                        },
+                        impersonate="chrome",
+                        timeout=20,
+                    )
+                    status = int(getattr(response, "status_code", 0) or 0)
+                    response_text = str(getattr(response, "text", "") or "")
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        payload = {}
             except Exception as e:
                 last_err = f"token 异常: {e}"
                 log(f"  ⚠️ {last_err}")
-                time.sleep(interval)
+                if not _wait_or_stop(interval, stop_event):
+                    log("  [*] Device Flow 轮询已停止")
+                    return None
                 continue
-            payload = {}
-            try:
-                payload = r.json()
-            except Exception:
-                payload = {}
             if not isinstance(payload, dict):
                 payload = {}
             err = str(payload.get("error") or "").strip()
-            if r.status_code >= 200 and r.status_code < 300 and payload.get("access_token"):
+            if status >= 200 and status < 300 and payload.get("access_token"):
                 token = _normalize_token_payload(payload)
                 if not token:
                     last_err = "token 缺 access_token"
@@ -652,36 +866,43 @@ def poll_device_token(
                     f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
                     + (" + refresh_token" if token.get("refresh_token") else "")
                 )
+                if stop_event is not None:
+                    stop_event.set()
                 return token
             if err == "authorization_pending":
                 last_err = err
-                time.sleep(interval)
+                if not _wait_or_stop(interval, stop_event):
+                    log("  [*] Device Flow 轮询已停止")
+                    return None
                 continue
             if err == "slow_down":
                 interval = min(interval + 5, 30)
                 last_err = err
-                time.sleep(interval)
+                if not _wait_or_stop(interval, stop_event):
+                    log("  [*] Device Flow 轮询已停止")
+                    return None
                 continue
             if err == "invalid_grant" and time.time() < grace_deadline:
                 # 授权刚提交时服务端可能尚未落库，宽限期内按 pending 处理
                 last_err = "invalid_grant(宽限期内重试)"
-                time.sleep(interval)
+                if not _wait_or_stop(interval, stop_event):
+                    log("  [*] Device Flow 轮询已停止")
+                    return None
                 continue
             if err in ("expired_token", "access_denied", "invalid_grant"):
                 desc = str(payload.get("error_description") or "").strip()
                 log(f"  ❌ device token 终态: {err} {desc}")
                 return None
-            last_err = f"HTTP {r.status_code} err={err or str(r.text)[:120]}"
+            last_err = f"HTTP {status} err={err or response_text[:120]}"
             log(f"  ⚠️ token 轮询: {last_err}")
-            time.sleep(interval)
+            if not _wait_or_stop(interval, stop_event):
+                log("  [*] Device Flow 轮询已停止")
+                return None
         log(f"  ❌ device-flow 轮询超时/失败: {last_err}")
         return None
     finally:
-        if own:
-            try:
-                s.close()
-            except Exception:
-                pass
+        # 共享 session 由协议路径的调用方持有；浏览器路径使用独立 urllib opener。
+        pass
 
 
 def sso_to_token_device_browser(
@@ -690,9 +911,10 @@ def sso_to_token_device_browser(
     proxy: str = "",
     log=print,
 ) -> dict | None:
-    """Device Flow：HTTP 申请 code + 浏览器点「继续/允许」+ HTTP 轮询 token。
+    """Device Flow：HTTP 申请 code，浏览器授权与 token 轮询并行。
 
-    browser_approve(user_code, open_url) -> bool
+    browser_approve(user_code, open_url, stop_event=None) -> bool
+    轮询拿到 access_token 时置位 stop_event。页面没到 done 不算成功。
     """
     sso_cookie = str(sso_cookie or "").strip()
     if not sso_cookie:
@@ -702,23 +924,8 @@ def sso_to_token_device_browser(
         log("  ❌ browser_approve 回调不可用")
         return None
 
-    # 轻量校验 SSO（带 cookie 的独立会话）
-    s_check = _new_sso_session(sso_cookie, proxy=proxy)
-    try:
-        r = s_check.get("https://accounts.x.ai/", impersonate="chrome", timeout=15)
-        final = str(getattr(r, "url", "") or "")
-        if "sign-in" in final or "sign-up" in final or int(getattr(r, "status_code", 0) or 0) == 401:
-            log("  ❌ sso 无效")
-            return None
-        log("  ✅ sso 有效（浏览器 Device 授权路径）")
-    except Exception as e:
-        log(f"  ❌ 网络错误: {e}")
+    if not _probe_sso_session(sso_cookie, proxy=proxy, log=log):
         return None
-    finally:
-        try:
-            s_check.close()
-        except Exception:
-            pass
 
     # device_code 申请不强制绑 SSO，对齐 CPA 服务端角色
     device = request_device_code(proxy=proxy, log=log, session=None)
@@ -729,24 +936,59 @@ def sso_to_token_device_browser(
         log(f"  ❌ verification URL 不受信: {open_url[:120]}")
         return None
     log(f"  [*] 浏览器授权: {open_url[:120]}")
+
+    stop_event = threading.Event()
+    token_box: dict = {}
+
+    def _poll() -> None:
+        try:
+            token = poll_device_token(
+                device["device_code"],
+                interval=device.get("interval", DEVICE_DEFAULT_INTERVAL),
+                expires_in=device.get("expires_in", DEVICE_DEFAULT_EXPIRES),
+                proxy=proxy,
+                log=log,
+                session=None,
+                grace_invalid_grant=DEVICE_GRACE_BROWSER,
+                max_wait=DEVICE_BROWSER_TIMEOUT_SECONDS,
+                stop_event=stop_event,
+                token_endpoint=device.get("token_endpoint", ""),
+            )
+            if token:
+                token_box["token"] = token
+        except Exception as exc:
+            log(f"  ❌ device token 轮询异常: {exc}")
+        finally:
+            stop_event.set()
+
+    worker = threading.Thread(target=_poll, name="device-browser-poll", daemon=True)
+    worker.start()
+    browser_done = False
     try:
-        ok = bool(browser_approve(device["user_code"], open_url))
-    except Exception as e:
-        log(f"  ❌ 浏览器授权异常: {e}")
-        return None
-    if not ok:
-        log("  ❌ 浏览器未完成 继续/允许")
-        return None
-    log("  ✅ 浏览器已提交「允许」，由 token 端点裁决结果")
-    return poll_device_token(
-        device["device_code"],
-        interval=device.get("interval", DEVICE_DEFAULT_INTERVAL),
-        expires_in=device.get("expires_in", DEVICE_DEFAULT_EXPIRES),
-        proxy=proxy,
-        log=log,
-        session=None,
-        grace_invalid_grant=DEVICE_GRACE_BROWSER,
-    )
+        try:
+            browser_done = bool(
+                browser_approve(device["user_code"], open_url, stop_event=stop_event)
+            )
+        except Exception as exc:
+            log(f"  ❌ 浏览器授权异常: {exc}")
+            browser_done = False
+    finally:
+        if not browser_done and "token" not in token_box:
+            stop_event.set()
+        worker.join(timeout=DEVICE_BROWSER_TIMEOUT_SECONDS + 30)
+        if worker.is_alive():
+            stop_event.set()
+            worker.join(timeout=5)
+            if worker.is_alive():
+                log("  ❌ device token 轮询线程未能停止")
+    token = token_box.get("token")
+    if token:
+        return token
+    if not browser_done:
+        log("  ❌ 浏览器未完成 Device 授权")
+    else:
+        log("  ❌ 浏览器 Device Flow 未取得 token")
+    return None
 
 
 def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
@@ -868,6 +1110,7 @@ def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print) -> dic
         log=log,
         session=s,
         grace_invalid_grant=DEVICE_GRACE_PROTOCOL,
+        token_endpoint=device.get("token_endpoint", ""),
     )
 
 
@@ -1132,11 +1375,15 @@ def sso_to_token(
         if allow_fallback:
             if callable(browser_approve):
                 order.append("device_browser")
-            order.append("device_protocol")
+            elif not callable(browser_approve):
+                order.append("device_protocol")
     else:
         if callable(browser_approve):
             order.append("device_browser")
-        order.append("device_protocol")
+            # 浏览器授权失败后直接走 Authorization Code；协议 approve 会
+            # 使用另一套会话上下文，当前 xAI 服务端经常返回 403。
+        else:
+            order.append("device_protocol")
         if allow_fallback:
             order.append("auth_code")
 

@@ -289,10 +289,11 @@ def _native_fill_profile(given_name: str, family_name: str, password: str) -> bo
     )
 
 
-def _dismiss_cookie_consent(log_callback=None):
+def _dismiss_cookie_consent(log_callback=None, page_obj=None):
     """尝试关闭 OneTrust / 通用 Cookie 同意横幅，避免遮挡按钮。"""
+    target = page if page_obj is None else page_obj
     try:
-        dismissed = page.run_js(r"""
+        dismissed = target.run_js(r"""
 // OneTrust: 点击 "Accept All" / "全部接受" 按钮
 const oneTrustBtn = document.querySelector('#onetrust-accept-btn-handler, #accept-recommended-btn-handler');
 if (oneTrustBtn) { oneTrustBtn.click(); return 'OneTrust'; }
@@ -300,7 +301,8 @@ if (oneTrustBtn) { oneTrustBtn.click(); return 'OneTrust'; }
 const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 for (const b of btns) {
     const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-    if (t === 'accept all' || t === 'accept' || t === 'agree' || t === '同意' || t === '全部接受' || t === '接受') {
+    if (t === 'accept all' || t === 'accept all cookies' || t === 'allow all' || t === 'allow all cookies'
+        || t === 'accept' || t === 'agree' || t === '同意' || t === '全部接受' || t === '全部允许' || t === '接受') {
         b.click(); return 'generic:' + t;
     }
 }
@@ -308,8 +310,9 @@ return '';
         """)
         if dismissed and log_callback:
             log_callback(f"[*] 已关闭 Cookie 横幅: {dismissed}")
+        return bool(dismissed)
     except Exception:
-        pass
+        return False
 
 
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
@@ -2731,118 +2734,22 @@ return 'final-page-clicked-submit';
     )
 
 
-# 点过「允许」后再观察 done 页多久；超时即交由 token 轮询裁决
-DEVICE_ALLOW_OBSERVE_SECONDS = 6.0
+# 与 auth_exchange.DEVICE_BROWSER_TIMEOUT_SECONDS 保持一致。
+DEVICE_BROWSER_TIMEOUT_SECONDS = 180
+DEVICE_ALLOW_SETTLE_SECONDS = 2.5
 
-_DEVICE_ALLOW_KEYS = ("允许", "allow", "approve", "accept")
-_DEVICE_CONTINUE_KEYS = ("继续", "continue", "下一步", "next", "确认", "confirm")
-_DEVICE_DENY_KEYS = ("拒绝", "deny", "cancel", "取消")
+_DEVICE_ALLOW_EXACT = frozenset({"允许", "allow", "authorize", "approve"})
+_DEVICE_CONTINUE_EXACT = frozenset({"继续", "continue"})
+_COOKIE_BANNER_NEEDLES = (
+    "全部允许",
+    "隐私偏好",
+    "privacy preference",
+    "allow all",
+    "accept all",
+    "onetrust",
+)
 
-
-def _click_device_button_native(page_obj, keywords) -> str:
-    """用 Playwright 真实事件点击按钮，返回被点按钮文本；未点到返回 ''。
-
-    consent 页两个 submit 按钮都没有 name/value，是 React 的 onClick 负责在提交前
-    填充隐藏字段 action=allow。JS 合成 click 会直接触发原生 form submit，抢在
-    onClick 之前把 action="" 发出去，服务端返回 Invalid action、授权不落库。
-    只有真实事件（isTrusted）才能让 React 正常填值。
-    """
-    try:
-        elements = page_obj.eles("tag:button")
-    except Exception:
-        return ""
-    for ele in elements:
-        try:
-            text = str(ele.text or "").strip()
-        except Exception:
-            continue
-        if not text:
-            continue
-        low = text.replace(" ", "").lower()
-        if any(k in low for k in _DEVICE_DENY_KEYS):
-            continue
-        if not any(k in low for k in keywords):
-            continue
-        try:
-            ele.click()
-            return text
-        except Exception:
-            continue
-    return ""
-
-
-def authorize_device_in_browser(
-    user_code: str,
-    open_url: str,
-    timeout: int = 90,
-    log_callback=None,
-    cancel_callback=None,
-) -> bool:
-    """在注册浏览器会话中完成 Device 页「继续」→「允许」。
-
-    对齐 CPA 管理页截图：打开 /oauth2/device?user_code=... 后点继续/允许。
-    """
-    user_code = str(user_code or "").strip()
-    open_url = str(open_url or "").strip()
-    if not user_code or not open_url:
-        if log_callback:
-            log_callback("[!] 浏览器 Device 授权参数不完整")
-        return False
-    if not open_url.startswith("https://") or "x.ai" not in open_url:
-        if log_callback:
-            log_callback(f"[!] 不受信的 device URL: {open_url[:120]}")
-        return False
-
-    refresh_active_page()
-    page_obj = active_page()
-    if page_obj is None:
-        if log_callback:
-            log_callback("[!] 无活动浏览器，无法 Device 授权")
-        return False
-
-    if log_callback:
-        log_callback(f"[*] 浏览器打开 Device 授权页 user_code={user_code}")
-
-    # Device 授权页可能被 SSO 重定向到 grok.com 中断，重试几次
-    device_nav_ok = False
-    for nav_attempt in range(3):
-        try:
-            page_obj.get(open_url)
-            page_obj.wait.doc_loaded()
-            # 检查是否真的停在了 device 页
-            current_url = str(page_obj.url or "")
-            if "oauth2/device" in current_url:
-                device_nav_ok = True
-                break
-            if log_callback:
-                log_callback(f"[Debug] Device 页导航被重定向到: {current_url}，重试 {nav_attempt + 1}/3")
-            sleep_with_cancel(1, cancel_callback)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] Device 页导航异常(第{nav_attempt + 1}次): {exc}")
-            sleep_with_cancel(1, cancel_callback)
-
-    if not device_nav_ok:
-        if log_callback:
-            log_callback("[!] 打开 Device 页失败：导航被重定向中断")
-        return False
-    sleep_with_cancel(0.6, cancel_callback)
-
-    deadline = time.time() + max(15, int(timeout or 90))
-    clicked_continue = False
-    clicked_allow = False
-    # 点过「允许」后只再观察这么久 done 页；成功与否最终由 token 轮询裁决
-    allow_observe_deadline = 0.0
-
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        refresh_active_page()
-        page_obj = active_page()
-        if page_obj is None:
-            return False
-        try:
-            state = page_obj.run_js(
-                r"""
+_DEVICE_PAGE_STATE_JS = r"""
 const userCode = String(arguments[0] || '').trim();
 function isVisible(node) {
   if (!node) return false;
@@ -2857,105 +2764,397 @@ function buttonText(node) {
     node.getAttribute('aria-label'), node.getAttribute('title'),
   ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
 }
-const url = String(location.href || '');
-const bodyText = String(document.body && document.body.innerText || '').slice(0, 4000);
-const lowBody = bodyText.toLowerCase();
-if (url.includes('/oauth2/device/done') ||
-    lowBody.includes('device authorized') ||
-    lowBody.includes('you have authorized') ||
-    bodyText.includes('设备已授权')) {
-  return {ok: true, stage: 'done', url};
-}
-if (url.includes('sign-in') || url.includes('sign-up')) {
-  return {ok: false, stage: 'need-login', url};
-}
-const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a')).filter(isVisible);
-function findBtn(preds) {
-  for (const node of buttons) {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    for (const p of preds) {
-      if (t.includes(p)) return node;
-    }
-  }
-  return null;
-}
-// 若有 user_code 输入框则填入
 const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible);
 for (const inp of inputs) {
   const name = String(inp.getAttribute('name') || inp.getAttribute('id') || '').toLowerCase();
-  const ph = String(inp.getAttribute('placeholder') || '').toLowerCase();
-  if (name.includes('user') || name.includes('code') || ph.includes('code') || ph.includes('代码')) {
-    if (userCode && String(inp.value || '').replace(/\s+/g, '') !== userCode.replace(/\s+/g, '')) {
-      inp.focus();
-      inp.value = userCode;
-      inp.dispatchEvent(new Event('input', {bubbles: true}));
-      inp.dispatchEvent(new Event('change', {bubbles: true}));
-    }
+  if (!name.includes('user') && !name.includes('code')) continue;
+  if (userCode && String(inp.value || '').replace(/\s+/g, '') !== userCode.replace(/\s+/g, '')) {
+    inp.focus();
+    inp.value = userCode;
+    inp.dispatchEvent(new Event('input', {bubbles: true}));
+    inp.dispatchEvent(new Event('change', {bubbles: true}));
   }
 }
-// 只做状态检测，不在 JS 里点击：consent 页「允许」是 React 受控 submit，
-// 合成 click 会抢在 onClick 填 action 之前触发原生提交，服务端回 Invalid action。
-const allowBtn = findBtn(['允许', 'allow', 'approve', '授权', 'accept']);
-const continueBtn = findBtn(['继续', 'continue', '下一步', 'next', 'confirm', '确认']);
+const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"], input[type="button"]')).filter(isVisible);
 return {
-  ok: false,
-  stage: allowBtn ? 'has-allow' : (continueBtn ? 'has-continue' : 'waiting'),
-  url,
-  text: buttonText(allowBtn || continueBtn || document.createElement('span')),
-  buttons: buttons.map(buttonText).filter(Boolean).slice(0, 6),
+  url: String(location.href || ''),
+  body: String(document.body && document.body.innerText || '').slice(0, 4000),
+  buttons: buttons.map(buttonText).filter(Boolean).slice(0, 12),
 };
-                """,
-                user_code,
-            )
+"""
+
+_DEVICE_FORCE_ALLOW_JS = r"""
+const labels = new Set(['允许', 'allow', 'authorize', 'approve']);
+function norm(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+const forms = Array.from(document.querySelectorAll('form'));
+const form = forms.find((item) => {
+  const text = (item.innerText || '').toLowerCase();
+  return text.includes('grok build') || text.includes('允许') || text.includes('allow') || text.includes('authorize');
+}) || document.querySelector('form');
+if (!form) return 'no-form';
+const formText = form.innerText || '';
+if (formText.includes('隐私偏好') || formText.includes('全部允许') || /allow all/i.test(formText)) {
+  return 'cookie-form';
+}
+let actionInput = form.querySelector('input[name=action]');
+if (!actionInput) {
+  actionInput = document.createElement('input');
+  actionInput.type = 'hidden';
+  actionInput.name = 'action';
+  form.appendChild(actionInput);
+}
+actionInput.value = 'allow';
+const button = Array.from(form.querySelectorAll('button')).find((item) => labels.has(norm(item.innerText)));
+if (button) {
+  button.click();
+  return 'clicked';
+}
+form.submit();
+return 'submitted';
+"""
+
+
+def _norm_device_button(text: str) -> str:
+    """折叠空白，并去掉相邻的重复词。
+
+    按钮文案会把 innerText 和 textContent 拼在一起，"Continue" 会变成
+    "Continue Continue"。只去相邻重复，避免把 "Allow all" 收成 "Allow"。
+    """
+    parts = [
+        part
+        for part in re.sub(r"\s+", " ", str(text or "")).strip().casefold().split(" ")
+        if part
+    ]
+    collapsed: list[str] = []
+    for part in parts:
+        if collapsed and collapsed[-1] == part:
+            continue
+        collapsed.append(part)
+    return " ".join(collapsed)
+
+
+def device_cookie_banner_visible(body: str) -> bool:
+    """识别 Cookie 同意层。页脚的 Cookie Policy 不算。"""
+    source = str(body or "")
+    lowered = source.lower()
+    return any(needle.lower() in lowered or needle in source for needle in _COOKIE_BANNER_NEEDLES)
+
+
+def next_device_approval_action(url: str, body: str, buttons, *, ignore_cookie: bool = False) -> str:
+    """根据页面决定下一步：done / reload / dismiss-cookie / need-login / click-allow / click-continue / wait。"""
+    resolved = str(url or "")
+    lowered_url = resolved.lower()
+    source = str(body or "")
+    lowered = source.lower()
+    if "/oauth2/device/done" in lowered_url or "device authorized" in lowered or "you have authorized" in lowered or "设备已授权" in source:
+        return "done"
+    if "invalid action" in lowered or "/oauth2/device/approve" in lowered_url:
+        return "reload"
+    if not ignore_cookie and device_cookie_banner_visible(source):
+        return "dismiss-cookie"
+    if "sign-in" in lowered_url or "sign-up" in lowered_url:
+        return "need-login"
+    labels = {_norm_device_button(item) for item in buttons or []}
+    if labels & _DEVICE_ALLOW_EXACT:
+        return "click-allow"
+    if labels & _DEVICE_CONTINUE_EXACT:
+        return "click-continue"
+    return "wait"
+
+
+def _click_device_button_exact(page_obj, labels: frozenset) -> str:
+    """用真实点击点整段文字匹配的按钮、链接或 submit 控件。"""
+    selectors = ("tag:button", "tag:a", "tag:input", '[role="button"]')
+    for selector in selectors:
+        try:
+            elements = page_obj.eles(selector)
+        except Exception:
+            continue
+        for ele in elements:
+            try:
+                if selector == "tag:input" and str(ele.attr("type") or "").lower() not in (
+                    "submit",
+                    "button",
+                ):
+                    continue
+                if getattr(ele.states, "is_displayed", True) is False:
+                    continue
+                if getattr(ele.states, "is_enabled", True) is False:
+                    continue
+                text = str(ele.text or "").strip()
+                if not text:
+                    text = str(
+                        ele.attr("aria-label")
+                        or ele.attr("title")
+                        or ele.attr("value")
+                        or ""
+                    ).strip()
+            except Exception:
+                continue
+            if _norm_device_button(text) not in labels:
+                continue
+            try:
+                ele.click()
+                return text
+            except Exception:
+                continue
+    return ""
+
+
+def _sleep_device(seconds: float, cancel_callback=None, stop_event=None) -> bool:
+    """等待。stop_event 已置位时返回 False。"""
+    deadline = time.time() + max(float(seconds), 0.0)
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        raise_if_cancelled(cancel_callback)
+        time.sleep(min(0.2, max(deadline - time.time(), 0.0)))
+    return not (stop_event is not None and stop_event.is_set())
+
+
+def _open_device_page(page_obj, open_url: str, log_callback=None, cancel_callback=None, stop_event=None) -> bool:
+    for nav_attempt in range(3):
+        if stop_event is not None and stop_event.is_set():
+            return False
+        try:
+            page_obj.get(open_url)
+            page_obj.wait.doc_loaded()
+            current_url = str(page_obj.url or "")
+            if "oauth2/device" in current_url:
+                return True
+            if log_callback:
+                log_callback(f"[Debug] Device 页导航被重定向到: {current_url}，重试 {nav_attempt + 1}/3")
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] Device 页脚本异常: {exc}")
-            sleep_with_cancel(0.8, cancel_callback)
+                log_callback(f"[Debug] Device 页导航异常(第{nav_attempt + 1}次): {exc}")
+        if not _sleep_device(1, cancel_callback, stop_event):
+            return False
+    return False
+
+
+def _read_device_page_state(page_obj, user_code: str):
+    state = page_obj.run_js(_DEVICE_PAGE_STATE_JS, user_code)
+    if not isinstance(state, dict):
+        return None
+    buttons = state.get("buttons")
+    if not isinstance(buttons, list):
+        buttons = []
+    return {
+        "url": str(state.get("url") or ""),
+        "body": str(state.get("body") or ""),
+        "buttons": [str(item) for item in buttons if str(item or "").strip()],
+    }
+
+
+def _force_device_allow(page_obj) -> str:
+    """先写入 action=allow，再提交 consent。避免空 action 被服务端拒绝。"""
+    try:
+        result = page_obj.run_js(_DEVICE_FORCE_ALLOW_JS)
+    except Exception:
+        return ""
+    return str(result or "")
+
+
+def _inject_device_sso_cookies(page_obj, sso_cookie: str, log_callback=None) -> int:
+    """把当前 SSO 复制到 Device Flow 会访问的 xAI/Grok 域名。"""
+    value = str(sso_cookie or "").strip()
+    context = getattr(page_obj, "raw_context", None)
+    if not value or context is None or not hasattr(context, "add_cookies"):
+        return 0
+    domains = (
+        ".x.ai",
+        "accounts.x.ai",
+        ".accounts.x.ai",
+        "auth.x.ai",
+        ".auth.x.ai",
+        "grok.com",
+        ".grok.com",
+    )
+    cookies = [
+        {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+        }
+        for name in ("sso", "sso-rw")
+        for domain in domains
+    ]
+    try:
+        context.add_cookies(cookies)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] Device Flow SSO cookie 注入失败: {exc}")
+        return 0
+    if log_callback:
+        log_callback(f"[*] Device Flow 已注入 SSO cookie: {len(cookies)} 项")
+    return len(cookies)
+
+
+def authorize_device_in_browser(
+    user_code: str,
+    open_url: str,
+    timeout: int = DEVICE_BROWSER_TIMEOUT_SECONDS,
+    log_callback=None,
+    cancel_callback=None,
+    stop_event=None,
+    page_obj=None,
+    sso_cookie: str = "",
+) -> bool:
+    """在注册浏览器里完成 Device 页「继续」和 consent「允许」。
+
+    真实点击后若仍停在 consent，改为写入 action=allow 再提交。
+    页面出现 Invalid action 时重新打开同一个 verification URL。
+    只有到达 done 页，或外部轮询已经拿到 token，才返回 True。
+    """
+    user_code = str(user_code or "").strip()
+    open_url = str(open_url or "").strip()
+    if not user_code or not open_url:
+        if log_callback:
+            log_callback("[!] 浏览器 Device 授权参数不完整")
+        return False
+    if not open_url.startswith("https://") or "x.ai" not in open_url:
+        if log_callback:
+            log_callback(f"[!] 不受信的 device URL: {open_url[:120]}")
+        return False
+
+    work_page = page_obj
+    if work_page is None:
+        refresh_active_page()
+        work_page = active_page()
+    if work_page is None:
+        if log_callback:
+            log_callback("[!] 无活动浏览器，无法 Device 授权")
+        return False
+
+    _inject_device_sso_cookies(work_page, sso_cookie, log_callback=log_callback)
+    if log_callback:
+        log_callback(f"[*] 浏览器打开 Device 授权页 user_code={user_code}")
+    if not _open_device_page(work_page, open_url, log_callback, cancel_callback, stop_event):
+        if stop_event is not None and stop_event.is_set():
+            return True
+        if log_callback:
+            log_callback("[!] 打开 Device 页失败：导航被重定向中断")
+        return False
+    if not _sleep_device(0.6, cancel_callback, stop_event):
+        return True
+
+    deadline = time.time() + max(15, int(timeout or DEVICE_BROWSER_TIMEOUT_SECONDS))
+    # 0 还没点允许，1 已真实点击，2 已强制写入 action=allow。
+    allow_phase = 0
+    allow_at = 0.0
+    clicked_continue = False
+    last_observation = ""
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            if log_callback:
+                log_callback("[*] token 轮询已结束，退出 Device 授权页")
+            return True
+        raise_if_cancelled(cancel_callback)
+        if page_obj is None:
+            refresh_active_page()
+            work_page = active_page()
+        if work_page is None:
+            return False
+        try:
+            state = _read_device_page_state(work_page, user_code)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[!] Device 页脚本异常: {exc}")
+            if not _sleep_device(0.8, cancel_callback, stop_event):
+                return True
+            continue
+        if state is None:
+            if not _sleep_device(0.6, cancel_callback, stop_event):
+                return True
             continue
 
-        if not isinstance(state, dict):
-            sleep_with_cancel(0.6, cancel_callback)
-            continue
-        stage = str(state.get("stage") or "")
-        if state.get("ok") or stage == "done":
+        action = next_device_approval_action(state["url"], state["body"], state["buttons"])
+        observation = f"{action}|{state['url']}|{' | '.join(state['buttons'][:6])}"
+        if log_callback and observation != last_observation:
+            last_observation = observation
+            log_callback(
+                f"[*] Device 页状态: {action} url={state['url'][:140]} "
+                f"buttons={' | '.join(state['buttons'][:6]) or 'none'}"
+            )
+        if action == "dismiss-cookie":
+            if _dismiss_cookie_consent(log_callback, work_page):
+                if not _sleep_device(0.6, cancel_callback, stop_event):
+                    return True
+                continue
+            action = next_device_approval_action(
+                state["url"], state["body"], state["buttons"], ignore_cookie=True
+            )
+        if action == "done":
             if log_callback:
                 log_callback("[*] 浏览器 Device 授权完成（done）")
             return True
-        if stage == "need-login":
-            if clicked_allow:
-                break
+        if action == "reload":
+            if log_callback:
+                log_callback("[!] Device 页返回 Invalid action，重新打开授权页")
+            allow_phase = 0
+            allow_at = 0.0
+            if not _open_device_page(work_page, open_url, log_callback, cancel_callback, stop_event):
+                if stop_event is not None and stop_event.is_set():
+                    return True
+                return False
+            continue
+        if action == "need-login":
             if log_callback:
                 log_callback("[!] Device 页要求重新登录，SSO 可能无效")
             return False
-        if stage == "has-allow" and not clicked_allow:
-            text = _click_device_button_native(page_obj, _DEVICE_ALLOW_KEYS)
-            if text:
+        if action == "click-allow":
+            if allow_phase and time.time() - allow_at < DEVICE_ALLOW_SETTLE_SECONDS:
+                if not _sleep_device(0.4, cancel_callback, stop_event):
+                    return True
+                continue
+            if allow_phase == 0:
+                text = _click_device_button_exact(work_page, _DEVICE_ALLOW_EXACT)
+                if text:
+                    if log_callback:
+                        log_callback(f"[*] 已点击「允许」(原生事件): {text}")
+                    allow_phase = 1
+                    allow_at = time.time()
+                else:
+                    forced = _force_device_allow(work_page)
+                    if log_callback:
+                        log_callback(f"[*] 未点到「允许」按钮，改写 action=allow 后提交: {forced or 'failed'}")
+                    allow_phase = 2
+                    allow_at = time.time()
+            elif allow_phase == 1:
+                forced = _force_device_allow(work_page)
                 if log_callback:
-                    log_callback(f"[*] 已点击「允许」(原生事件): {text}")
-                clicked_allow = True
-                allow_observe_deadline = time.time() + DEVICE_ALLOW_OBSERVE_SECONDS
-            sleep_with_cancel(1.0, cancel_callback)
+                    log_callback(f"[*] 真实点击未离开 consent，改写 action=allow 后提交: {forced or 'failed'}")
+                allow_phase = 2
+                allow_at = time.time()
+            else:
+                if log_callback:
+                    log_callback("[!] 允许提交后仍在 consent，重新打开 Device 页")
+                allow_phase = 0
+                allow_at = 0.0
+                if not _open_device_page(work_page, open_url, log_callback, cancel_callback, stop_event):
+                    if stop_event is not None and stop_event.is_set():
+                        return True
+                    return False
             continue
-        if clicked_allow and time.time() >= allow_observe_deadline:
-            # 已提交授权但页面无已知 done 文案，交给 token 轮询判定真实结果
-            break
-        if stage == "has-continue" and not clicked_allow:
-            text = _click_device_button_native(page_obj, _DEVICE_CONTINUE_KEYS)
+        if action == "click-continue":
+            allow_phase = 0
+            allow_at = 0.0
+            text = _click_device_button_exact(work_page, _DEVICE_CONTINUE_EXACT)
             if text and not clicked_continue:
                 clicked_continue = True
                 if log_callback:
                     log_callback(f"[*] 已点击「继续」(原生事件): {text}")
-            sleep_with_cancel(1.0, cancel_callback)
+            if not _sleep_device(1.0, cancel_callback, stop_event):
+                return True
             continue
-        sleep_with_cancel(0.7, cancel_callback)
+        if not _sleep_device(0.7, cancel_callback, stop_event):
+            return True
 
-    if clicked_allow:
-        if log_callback:
-            log_callback("[*] 已提交「允许」，未见 done 页；改由 token 轮询判定")
-        return True
     if log_callback:
-        log_callback(
-            f"[!] 浏览器 Device 授权失败：未点到「允许」"
-            f"(continue={clicked_continue})"
-        )
+        log_callback("[!] 浏览器 Device 授权超时：未到达 done 页")
     return False

@@ -1966,14 +1966,32 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
         }
         _cpa_log(f"SSO → {_mode_labels.get(token_mode, token_mode)} 换 token (proxy={proxy}) ...")
 
-        def _browser_approve(user_code, open_url):
-            return authorize_device_in_browser(
-                user_code,
-                open_url,
-                timeout=90,
-                log_callback=log_callback,
-                cancel_callback=None,
-            )
+        def _browser_approve(user_code, open_url, stop_event=None):
+            device_page = None
+            browser_obj = _active_browser()
+            if browser_obj is not None and hasattr(browser_obj, "new_tab"):
+                try:
+                    device_page = browser_obj.new_tab()
+                    _cpa_log("已创建独立 Device 授权页")
+                except Exception as exc:
+                    _cpa_log(f"创建独立 Device 授权页失败，复用当前页: {exc}")
+            try:
+                return authorize_device_in_browser(
+                    user_code,
+                    open_url,
+                    timeout=_s2cpa.DEVICE_BROWSER_TIMEOUT_SECONDS,
+                    log_callback=log_callback,
+                    cancel_callback=None,
+                    stop_event=stop_event,
+                    page_obj=device_page,
+                    sso_cookie=sso,
+                )
+            finally:
+                if device_page is not None:
+                    try:
+                        device_page.close()
+                    except Exception as exc:
+                        _cpa_log(f"关闭独立 Device 授权页失败: {exc}")
 
         # device_browser 模式：需要活动浏览器来点「继续/允许」
         # device_protocol 模式：纯 HTTP 协议换 token，不依赖浏览器
