@@ -1128,7 +1128,7 @@ def _mailnest_log(log_callback, message: str) -> None:
     registration_log(message)
 
 
-def prepare_mailnest_pool(log_callback=None) -> None:
+def prepare_mailnest_pool(log_callback=None, cancel_callback=None) -> None:
     """把订单池挂到 SQLite，并找回上次进程留下的邮箱。
 
     已扣费且没过期的继续复用；没收到过验证码的调释放接口把冻结金额退回。
@@ -1136,6 +1136,7 @@ def prepare_mailnest_pool(log_callback=None) -> None:
     """
     if not _using_mailnest():
         return
+    raise_if_cancelled(cancel_callback)
     try:
         store = get_registration_repository()
     except Exception as exc:
@@ -1149,6 +1150,7 @@ def prepare_mailnest_pool(log_callback=None) -> None:
             f"[*] MailNest 找回 {len(result.restored)} 个已扣费邮箱，下一轮继续使用",
         )
     for order in result.stale:
+        raise_if_cancelled(cancel_callback)
         _mailnest_log(log_callback, f"[*] MailNest 上次没用完的邮箱，尝试释放退回冻结: {order.email}")
         _mailnest_release(order.email, log_callback)
 
@@ -1177,6 +1179,15 @@ def finish_mailnest_email(email: str) -> None:
     if not _using_mailnest():
         return
     mailnest_provider.drop_order(str(email or ""))
+
+
+def defer_cancelled_mailnest_email(email, *, sso="") -> None:
+    if not _using_mailnest():
+        return
+    if sso:
+        mailnest_provider.drop_order(email)
+    else:
+        mailnest_provider.defer_order(email)
 
 
 def _mailnest_release(email: str, log_callback=None) -> str:
@@ -1282,6 +1293,7 @@ def _rotate_mailnest_after_code_rate_limit(
     mail_try,
     max_mail_retry,
 ):
+    raise_if_cancelled(cancel_callback)
     address = current_attempt_email(email, exc) or mailnest_provider.active_email()
     settle_mailnest_email(
         address,
@@ -1747,6 +1759,7 @@ def ensure_sso_oauth_eligible(
     email="",
     log_callback=None,
     result_out=None,
+    cancel_callback=None,
 ) -> dict:
     """按配置复查 SSO 风控状态；详细模式同时验证会话与账号资料。"""
     detailed = bool(config.get("sso_detailed_risk_check", False))
@@ -1788,9 +1801,13 @@ def ensure_sso_oauth_eligible(
     last_state = {}
 
     for attempt, delay in enumerate(retry_delays, start=1):
+        raise_if_cancelled(cancel_callback)
         if delay:
             _risk_log(f"风控字段尚未稳定，{delay}s 后进行第 {attempt} 次检查")
-            time.sleep(delay)
+            if cancel_callback is None:
+                time.sleep(delay)
+            else:
+                sleep_with_cancel(delay, cancel_callback)
         mode_label = "详细检查 SSO 会话与 botFlag" if detailed else "检查新账号注册风控状态"
         _risk_log(f"{mode_label} ({attempt}/{len(retry_delays)}) ...")
         if detailed:
@@ -1801,6 +1818,7 @@ def ensure_sso_oauth_eligible(
                 proxy=proxy,
                 log=_risk_log,
             )
+        raise_if_cancelled(cancel_callback)
         last_state = state
         _set_risk_state(state)
         source = state.get("bot_flag_source")
@@ -1852,13 +1870,14 @@ def ensure_sso_oauth_eligible(
             "本次未得到稳定风控结论: "
             f"{state.get('error') or 'botFlag 字段为空'}"
         )
+        raise_if_cancelled(cancel_callback)
 
     reason = str(last_state.get("error") or "botFlag 字段持续为空")
     _risk_log(f"注册风控状态无法确认，继续 OAuth: {reason}")
     return last_state
 
 
-def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> bool:
+def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None, cancel_callback=None) -> bool:
     """SSO → Device Flow（失败回退授权码）换 token → 写入 CPA / Grok2API。
 
     返回 True 表示入库成功（或未开启/无需转换）；False 表示转换失败（SSO 仍可能已写入 accounts）。
@@ -1951,6 +1970,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
     proxy = _resolve_cpa_proxy()
 
     def _cpa_log(message):
+        raise_if_cancelled(cancel_callback)
         if log_callback:
             log_callback(f"[CPA] {redact_proxy_text(message).strip()}")
 
@@ -1981,7 +2001,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
                     open_url,
                     timeout=_s2cpa.DEVICE_BROWSER_TIMEOUT_SECONDS,
                     log_callback=log_callback,
-                    cancel_callback=None,
+                    cancel_callback=cancel_callback,
                     stop_event=stop_event,
                     page_obj=device_page,
                     sso_cookie=sso,
@@ -2007,6 +2027,9 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
         prefer = "auth_code" if token_mode == "auth_code" else "device"
         browser_cb = _browser_approve if use_browser else None
 
+        token_options = {}
+        if cancel_callback is not None:
+            token_options["cancel_callback"] = cancel_callback
         token = _s2cpa.sso_to_token(
             sso,
             proxy=proxy,
@@ -2014,7 +2037,9 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
             prefer=prefer,
             allow_fallback=True,
             browser_approve=browser_cb,
+            **token_options,
         )
+        raise_if_cancelled(cancel_callback)
         if not token:
             _set_result(status="failed", error="SSO 换 token 失败")
             _cpa_log("换 token 失败；SSO 已在 accounts 文件，稍后可重转")
@@ -2249,6 +2274,10 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
             error="; ".join(auth_errors),
         )
         return True
+    except _s2cpa.TokenExchangeCancelled as exc:
+        raise RegistrationCancelled("用户停止注册") from exc
+    except RegistrationCancelled:
+        raise
     except Exception as exc:
         _set_result(status="failed", error=str(exc))
         _cpa_log(f"直出失败: {exc}")
@@ -2969,13 +2998,14 @@ def _wait_until_on_grok(page_obj, timeout: float) -> bool:
     return False
 
 
-def _open_grok_for_nsfw(page_obj, log_callback=None) -> None:
+def _open_grok_for_nsfw(page_obj, log_callback=None, cancel_callback=None) -> None:
     """让浏览器停在 grok.com。优先等注册自身的跳转落地，落不了再主动导航。
 
     注册提交后 accounts.x.ai 会自己跳到 grok.com（redirect=grok-com），SSO
     cookie 在跳转途中就已写入。此时立刻 goto 会和这次跳转互相打断：Camoufox
     上报 NS_BINDING_ABORTED，或者 goto 一直等不到 DOM 直到超时。
     """
+    raise_if_cancelled(cancel_callback)
     if _wait_until_on_grok(page_obj, _NSFW_REDIRECT_WAIT_SECONDS):
         if log_callback:
             log_callback("[*] 注册跳转已到达 grok.com，无需再打开")
@@ -2986,10 +3016,12 @@ def _open_grok_for_nsfw(page_obj, log_callback=None) -> None:
             f"(当前 {getattr(page_obj, 'url', '') or '-'})"
         )
     for attempt in (1, 2):
+        raise_if_cancelled(cancel_callback)
         try:
             page_obj.get("https://grok.com/", timeout=_NSFW_GOTO_TIMEOUT_MS)
             return
         except Exception as exc:
+            raise_if_cancelled(cancel_callback)
             # goto 超时或被打断时，导航可能已经提交到 grok.com，后面还会再等 DOM。
             if _is_grok_url(getattr(page_obj, "url", "")):
                 return
@@ -3004,7 +3036,7 @@ def _open_grok_for_nsfw(page_obj, log_callback=None) -> None:
                 return
 
 
-def enable_nsfw_via_browser(token="", log_callback=None):
+def enable_nsfw_via_browser(token="", log_callback=None, cancel_callback=None):
     """在已登录的注册浏览器内调用 grok.com 接口，绕过外部 HTTP 的 CF 拦截。"""
     page_obj = _active_page()
     if page_obj is None:
@@ -3040,13 +3072,14 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
                     )
                 except Exception:
                     pass
-        _open_grok_for_nsfw(page_obj, log_callback=log_callback)
+        _open_grok_for_nsfw(page_obj, log_callback=log_callback, cancel_callback=cancel_callback)
         try:
             page_obj.wait.doc_loaded()
         except Exception:
             pass
         # 等 CF 挑战结束，否则 fetch 也会拿到 Just a moment
         for i in range(25):
+            raise_if_cancelled(cancel_callback)
             try:
                 title = str(page_obj.run_js("return document.title || '';") or "").lower()
                 body = str(
@@ -3060,11 +3093,11 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
                         break
             except Exception:
                 pass
-            time.sleep(1.0)
+            sleep_with_cancel(1.0, cancel_callback)
         else:
             if log_callback:
                 log_callback("[!] grok.com 仍停在 Cloudflare 挑战页，浏览器内 NSFW 可能失败")
-        time.sleep(1.0)
+        sleep_with_cancel(1.0, cancel_callback)
 
         result = page_obj.run_js(
             r"""
@@ -3154,13 +3187,17 @@ return (async () => {
         if "just a moment" in nsfw_body.lower() or nsfw_status == 403:
             return False, f"浏览器内 update_nsfw 被 CF 拦截 HTTP {nsfw_status}"
         return False, f"浏览器内 update_nsfw HTTP {nsfw_status}: {nsfw_body[:160]}"
+    except RegistrationCancelled:
+        raise
     except Exception as exc:
+        raise_if_cancelled(cancel_callback)
         if log_callback:
             log_callback(f"[Debug] 浏览器内 NSFW 异常: {exc}")
         return False, f"浏览器内 NSFW 异常: {exc}"
 
 
-def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=None):
+def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=None, cancel_callback=None):
+    raise_if_cancelled(cancel_callback)
     proxies = get_proxies()
     ua = user_agent or get_user_agent()
     if log_callback:
@@ -3172,7 +3209,7 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
     if _active_page() is not None:
         if log_callback:
             log_callback("[*] NSFW 通过浏览器执行...")
-        return enable_nsfw_via_browser(token=token, log_callback=log_callback)
+        return enable_nsfw_via_browser(token=token, log_callback=log_callback, cancel_callback=cancel_callback)
 
     # 无活动浏览器时尝试 HTTP 快速路径
     def _browser_fallback(reason):
@@ -3180,7 +3217,8 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
             return False, reason
         if log_callback:
             log_callback(f"[*] NSFW HTTP 快速路径未成功: {reason}，回退浏览器过盾...")
-        ok, message = enable_nsfw_via_browser(token=token, log_callback=log_callback)
+        raise_if_cancelled(cancel_callback)
+        ok, message = enable_nsfw_via_browser(token=token, log_callback=log_callback, cancel_callback=cancel_callback)
         if ok:
             return True, message
         return False, f"{reason}; browser fallback: {message}"
@@ -3200,16 +3238,21 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
                     "accept-language": "en-US,en;q=0.9",
                 }
             )
+            raise_if_cancelled(cancel_callback)
             ok, message = set_tos_accepted(session, log_callback)
             if not ok:
                 return _browser_fallback(message)
+            raise_if_cancelled(cancel_callback)
             ok, message = set_birth_date(session, log_callback)
             if not ok:
                 return _browser_fallback(message)
+            raise_if_cancelled(cancel_callback)
             ok, message = update_nsfw_settings(session, log_callback)
             if not ok:
                 return _browser_fallback(message)
             return True, "成功开启 NSFW（HTTP 快速路径）"
+    except RegistrationCancelled:
+        raise
     except Exception as e:
         return _browser_fallback(f"HTTP 快速路径异常: {e}")
 
@@ -3333,6 +3376,8 @@ def registration_log(message):
 
 def run_registration(count):
     controller = RegistrationStopController()
+    if controller.should_stop():
+        return
     reset_network_route_logs()
     if get_email_provider() == "outlookemail":
         reset_outlookemail_runtime_state()
@@ -3374,15 +3419,29 @@ def run_registration(count):
     except Exception:
         pass
     try:
-        startup_checks = _conn.run_connectivity_checks(config, http_get, http_post)
+        def checked_request(request, *args, **kwargs):
+            raise_if_cancelled(controller.should_stop)
+            result = request(*args, **kwargs)
+            raise_if_cancelled(controller.should_stop)
+            return result
+
+        def checked_get(*args, **kwargs):
+            return checked_request(http_get, *args, **kwargs)
+
+        def checked_post(*args, **kwargs):
+            return checked_request(http_post, *args, **kwargs)
+
+        startup_checks = _conn.run_connectivity_checks(config, checked_get, checked_post)
+        if controller.should_stop():
+            return
         for name, ok, detail in startup_checks:
             registration_log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
 
         def _retry_xai_signup_check():
-            time.sleep(1)
+            sleep_with_cancel(1, controller.should_stop)
             return _conn.check_xai_signup(
                 resolve_proxy_url(config.get("proxy", "")),
-                http_get,
+                checked_get,
             )
 
         startup_checks = _conn.retry_timeout_xai_check(
@@ -3401,10 +3460,14 @@ def run_registration(count):
             )
             registration_log(_conn.startup_block_message(detail))
             return
+    except RegistrationCancelled:
+        return
     except Exception as exc:
         registration_log(f"[!] 启动连通性检查异常，继续注册: {exc}")
     try:
-        prepare_mailnest_pool(registration_log)
+        prepare_mailnest_pool(registration_log, cancel_callback=controller.should_stop)
+    except RegistrationCancelled:
+        return
     except Exception as exc:
         registration_log(f"[!] MailNest 订单池恢复异常，继续注册: {exc}")
 
@@ -3565,12 +3628,14 @@ def run_registration(count):
                             email=email,
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             result_out=cpa_detail,
+                            cancel_callback=controller.should_stop,
                         )
                         finish_mailnest_email(email)
                         if config.get("enable_nsfw", True):
                             nsfw_ok, nsfw_msg = enable_nsfw_for_token(
                                 sso,
                                 log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                                cancel_callback=controller.should_stop,
                             )
                             nsfw_status = "成功" if nsfw_ok else f"失败: {nsfw_msg}"
                         else:
@@ -3597,6 +3662,7 @@ def run_registration(count):
                             email=email,
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             result_out=cpa_detail,
+                            cancel_callback=controller.should_stop,
                         )
                         if not registration_counts_as_success(cpa_detail):
                             reason = cpa_failure_reason(cpa_detail)
@@ -3664,11 +3730,8 @@ def run_registration(count):
                             )
                     except RegistrationCancelled:
                         cancelled_email = current_attempt_email(email) or mailnest_provider.active_email()
-                        settle_mailnest_email(
-                            cancelled_email,
-                            sso=sso,
-                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                        )
+                        if cancelled_email:
+                            defer_cancelled_mailnest_email(cancelled_email, sso=sso)
                         if cancelled_email:
                             _persist_result(
                                 started_at=attempt_started_at,
@@ -3684,6 +3747,9 @@ def run_registration(count):
                             )
                         break
                     except EmailDomainRejected as exc:
+                        if controller.should_stop():
+                            defer_cancelled_mailnest_email(current_attempt_email(email, exc), sso=sso)
+                            break
                         kind = classify_failure(exc)
                         fail_email = current_attempt_email(email, exc) or mailnest_provider.active_email()
                         settle_mailnest_email(
@@ -3709,6 +3775,9 @@ def run_registration(count):
                         )
                         registration_log(f"[W{wid+1}] [-] 域名拒绝: {exc}")
                     except AccountRetryNeeded as exc:
+                        if controller.should_stop():
+                            defer_cancelled_mailnest_email(current_attempt_email(email, exc), sso=sso)
+                            break
                         settle_mailnest_email(
                             current_attempt_email(email, exc) or mailnest_provider.active_email(),
                             exc,
@@ -3742,6 +3811,42 @@ def run_registration(count):
                             registration_log(f"[W{wid+1}] [!] {exc}")
                     except Exception as exc:
                         fail_email = current_attempt_email(email, exc) or mailnest_provider.active_email()
+                        if isinstance(exc, _rf.EmailSignupUnavailable):
+                            controller.stop()
+                            if fail_email:
+                                defer_cancelled_mailnest_email(fail_email, sso=sso)
+                                _persist_result(
+                                    started_at=attempt_started_at,
+                                    worker_id=wid,
+                                    email=fail_email,
+                                    password=current_attempt_password(profile),
+                                    status="failure",
+                                    cpa_detail=cpa_detail,
+                                    failure_type=FAIL_OTHER,
+                                    failure_reason=str(exc),
+                                    account_file=email_file,
+                                    sso_saved=bool(email_file),
+                                    nsfw_status=nsfw_status,
+                                )
+                            registration_log(f"[W{wid+1}] [!] xAI 邮箱注册暂不可用，本批任务停止")
+                            break
+                        if controller.should_stop():
+                            if fail_email:
+                                defer_cancelled_mailnest_email(fail_email, sso=sso)
+                                _persist_result(
+                                    started_at=attempt_started_at,
+                                    worker_id=wid,
+                                    email=fail_email,
+                                    password=current_attempt_password(profile),
+                                    status="cancelled",
+                                    cpa_detail=cpa_detail,
+                                    failure_reason="用户停止注册",
+                                    account_file=email_file,
+                                    sso_saved=bool(email_file),
+                                    nsfw_status=nsfw_status,
+                                )
+                            registration_log(f"[W{wid+1}] [!] 注册被停止（跳过失败后的邮箱网络结算）")
+                            break
                         if settle_mailnest_email(
                             fail_email,
                             exc,
@@ -3956,12 +4061,13 @@ def run_registration(count):
                     email=email,
                     log_callback=registration_log,
                     result_out=cpa_detail,
+                    cancel_callback=controller.should_stop,
                 )
                 finish_mailnest_email(email)
                 if config.get("enable_nsfw", True):
                     registration_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, log_callback=registration_log
+                        sso, log_callback=registration_log, cancel_callback=controller.should_stop
                     )
                     if nsfw_ok:
                         nsfw_status = "成功"
@@ -3986,6 +4092,7 @@ def run_registration(count):
                     email=email,
                     log_callback=registration_log,
                     result_out=cpa_detail,
+                    cancel_callback=controller.should_stop,
                 )
                 counted_success = False
                 if not registration_counts_as_success(cpa_detail):
@@ -4058,7 +4165,8 @@ def run_registration(count):
                     )
             except RegistrationCancelled:
                 cancelled_email = current_attempt_email(email) or mailnest_provider.active_email()
-                settle_mailnest_email(cancelled_email, sso=sso, log_callback=registration_log)
+                if cancelled_email:
+                    defer_cancelled_mailnest_email(cancelled_email, sso=sso)
                 if cancelled_email:
                     _persist_result(
                         started_at=attempt_started_at,
@@ -4074,6 +4182,9 @@ def run_registration(count):
                 registration_log("[!] 注册被停止")
                 break
             except EmailDomainRejected as exc:
+                if controller.should_stop():
+                    defer_cancelled_mailnest_email(current_attempt_email(email, exc), sso=sso)
+                    break
                 kind = _record_failure(exc)
                 fail_email = current_attempt_email(email, exc) or mailnest_provider.active_email()
                 settle_mailnest_email(
@@ -4097,6 +4208,9 @@ def run_registration(count):
                 registration_log(f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                 registration_log("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
             except AccountRetryNeeded as exc:
+                if controller.should_stop():
+                    defer_cancelled_mailnest_email(current_attempt_email(email, exc), sso=sso)
+                    break
                 settle_mailnest_email(
                     current_attempt_email(email, exc) or mailnest_provider.active_email(),
                     exc,
@@ -4132,6 +4246,43 @@ def run_registration(count):
                     registration_log(f"[-] 当前账号已达到最大重试次数，跳过 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
             except Exception as exc:
                 fail_email = current_attempt_email(email, exc) or mailnest_provider.active_email()
+                if isinstance(exc, _rf.EmailSignupUnavailable):
+                    controller.stop()
+                    if fail_email:
+                        defer_cancelled_mailnest_email(fail_email, sso=sso)
+                        _persist_result(
+                            started_at=attempt_started_at,
+                            email=fail_email,
+                            password=current_attempt_password(profile),
+                            status="failure",
+                            cpa_detail=cpa_detail,
+                            failure_type=FAIL_OTHER,
+                            failure_reason=str(exc),
+                            account_file=email_file,
+                            sso_saved=bool(email_file),
+                            nsfw_status=nsfw_status,
+                        )
+                    registration_log("[!] xAI 邮箱注册暂不可用，本批任务停止")
+                    break
+                if controller.should_stop():
+                    # 停止时浏览器通常已经被 interrupt_browser_work 关闭，
+                    # 这里不能再走 MailNest 网络结算，否则停止线程会卡在
+                    # release/HTTP 请求，任务快照长期保持 running=true。
+                    if fail_email:
+                        defer_cancelled_mailnest_email(fail_email, sso=sso)
+                        _persist_result(
+                            started_at=attempt_started_at,
+                            email=fail_email,
+                            password=current_attempt_password(profile),
+                            status="cancelled",
+                            cpa_detail=cpa_detail,
+                            failure_reason="用户停止注册",
+                            account_file=email_file,
+                            sso_saved=bool(email_file),
+                            nsfw_status=nsfw_status,
+                        )
+                    registration_log("[!] 注册被停止（跳过失败后的邮箱网络结算）")
+                    break
                 if settle_mailnest_email(fail_email, exc, sso=sso, log_callback=registration_log) == "retry_same":
                     continue
                 kind = _record_failure(exc)

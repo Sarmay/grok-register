@@ -333,6 +333,18 @@ def claim_reusable(blocked: Optional[BlockedEmail] = None, now: Optional[float] 
     return None
 
 
+def defer_order(email: str) -> None:
+    """停止时只移出内存池，保留落盘订单供下次启动结算，避免等待收信 API。"""
+    global _hydrated
+    key = str(email or "").strip()
+    with _pool_lock:
+        _inflight.pop(key, None)
+        _available.pop(key, None)
+        _hydrated = False
+    if active_email() == key:
+        _remember_active("")
+
+
 def drop_order(email: str) -> None:
     key = str(email or "").strip()
     if not key:

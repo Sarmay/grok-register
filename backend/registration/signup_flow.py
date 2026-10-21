@@ -41,6 +41,14 @@ class TurnstileWidgetRejected(Exception):
     """资料页 Turnstile 已失败或组件空白，继续点击不会产生 token。"""
 
 
+class EmailSignupUnavailable(Exception):
+    """站点明确表示当前无法使用邮箱注册，应结束本批任务。"""
+
+    def __init__(self, email="", message=""):
+        self.email = str(email or "")
+        super().__init__(message or "xAI 邮箱注册暂不可用")
+
+
 _CODE_RATE_LIMIT_PATTERNS = (
     re.compile(r"too many code requests", re.I),
     re.compile(r"before requesting another code", re.I),
@@ -825,6 +833,13 @@ def detect_email_code_rate_limit():
     return looks_like_email_code_rate_limit(_visible_page_text())
 
 
+def raise_if_email_signup_unavailable(email=""):
+    text = _visible_page_text()
+    match = re.search(r"email\s+sign[- ]?up\s+isn[’']t\s+available\s+right\s+now[^\n]{0,80}", text, re.I)
+    if match:
+        raise EmailSignupUnavailable(email=email, message=match.group(0).strip())
+
+
 def raise_if_email_code_rate_limited(email=""):
     message = detect_email_code_rate_limit()
     if not message:
@@ -1059,6 +1074,7 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
     deadline = time.time() + wait
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        raise_if_email_signup_unavailable(email)
         raise_if_email_domain_rejected(email)
         raise_if_email_code_rate_limited(email)
         if _email_page_advanced_once(email):
@@ -1066,6 +1082,7 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
         sleep_with_cancel(0.4, cancel_callback)
     raise_if_email_domain_rejected(email)
     raise_if_email_code_rate_limited(email)
+    raise_if_email_signup_unavailable(email)
     return False
 
 
@@ -1105,6 +1122,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     last_submit_clicked_at = None
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        raise_if_email_signup_unavailable(email)
         raise_if_email_domain_rejected(email)
         raise_if_email_code_rate_limited(email)
         # 邮箱提交后的跳转有时超过 _wait_email_page_advanced 的短确认窗口。

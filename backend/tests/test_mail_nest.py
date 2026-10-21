@@ -14,6 +14,20 @@ def _response(payload):
 
 
 class MailNestPoolTests(unittest.TestCase):
+    def test_cancel_defers_unreceived_order_without_network_or_losing_refund_tracking(self):
+        store = mock.Mock()
+        order = mail_nest.MailOrder(email="cancelled@example.com", expired_at=time.time() + 1000)
+        store.list_mailnest_orders.return_value = [order.to_payload(mail_nest.STATE_INFLIGHT)]
+        mail_nest.bind_store(store)
+        mail_nest.track_order(order)
+        with mock.patch.object(gr, "http_post") as post:
+            gr.defer_cancelled_mailnest_email(order.email)
+        post.assert_not_called()
+        store.delete_mailnest_order.assert_not_called()
+        self.assertIsNone(mail_nest.get_order(order.email))
+        restored = mail_nest.hydrate()
+        self.assertEqual([item.email for item in restored.stale], [order.email])
+
     def setUp(self):
         self.original_config = dict(gr.config)
         gr.config["email_provider"] = "mailnest"

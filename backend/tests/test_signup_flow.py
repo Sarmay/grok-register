@@ -6,6 +6,15 @@ from backend.registration import signup_flow
 
 
 class SignupFlowTests(unittest.TestCase):
+    def test_signup_unavailable_stops_before_resubmission(self):
+        for apostrophe in ("'", "’"):
+            notice = f"Email sign-up isn{apostrophe}t available right now. Sign up another way."
+            with mock.patch.object(signup_flow, "_visible_page_text", return_value=notice):
+                with self.assertRaises(signup_flow.EmailSignupUnavailable) as caught:
+                    signup_flow._wait_email_page_advanced("fixture@example.com")
+            self.assertEqual(caught.exception.email, "fixture@example.com")
+            self.assertIn("available right now", str(caught.exception))
+
     class NativeInput:
         def __init__(self, current_value=""):
             self.current_value = current_value

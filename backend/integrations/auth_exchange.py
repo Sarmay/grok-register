@@ -322,6 +322,8 @@ def _discover_action_ids_from_js(session, html: str, base_url: str = "https://ac
         try:
             resp = session.get(full, impersonate="chrome", timeout=15)
             text = str(resp.text or "")
+        except TokenExchangeCancelled:
+            raise
         except Exception:
             continue
         fetched += 1
@@ -344,7 +346,16 @@ def _discover_action_ids_from_js(session, html: str, base_url: str = "https://ac
     return ordered
 
 
-def _new_sso_session(sso_cookie: str, proxy: str = ""):
+class TokenExchangeCancelled(Exception):
+    """调用方要求停止授权交换。"""
+
+
+def _check_token_cancelled(cancel_callback=None):
+    if cancel_callback is not None and cancel_callback():
+        raise TokenExchangeCancelled("授权交换已停止")
+
+
+def _new_sso_session(sso_cookie: str, proxy: str = "", cancel_callback=None):
     """创建带 SSO cookie 的 curl_cffi Session。"""
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = requests.Session()
@@ -353,6 +364,16 @@ def _new_sso_session(sso_cookie: str, proxy: str = ""):
     for domain in (".x.ai", "accounts.x.ai", "auth.x.ai", ".grok.com", "grok.com"):
         s.cookies.set("sso", sso_cookie, domain=domain)
         s.cookies.set("sso-rw", sso_cookie, domain=domain)
+    if cancel_callback is not None:
+        request = s.request
+
+        def cancellable_request(*args, **kwargs):
+            _check_token_cancelled(cancel_callback)
+            response = request(*args, **kwargs)
+            _check_token_cancelled(cancel_callback)
+            return response
+
+        s.request = cancellable_request
     return s
 
 
@@ -532,7 +553,9 @@ def _device_http_request(
     form: dict | None = None,
     proxy: str = "",
     timeout: float = 20,
+    cancel_callback=None,
 ) -> tuple[int, dict | str, str]:
+    _check_token_cancelled(cancel_callback)
     data = None
     headers = {
         "Accept": "application/json",
@@ -550,6 +573,7 @@ def _device_http_request(
     except urllib.error.HTTPError as exc:
         status = int(exc.code)
         body = exc.read().decode("utf-8", errors="replace")
+    _check_token_cancelled(cancel_callback)
     try:
         payload = json.loads(body)
     except Exception:
@@ -557,7 +581,7 @@ def _device_http_request(
     return status, payload, body
 
 
-def _discover_device_endpoints(proxy: str = "", log=print) -> dict[str, str]:
+def _discover_device_endpoints(proxy: str = "", log=print, cancel_callback=None) -> dict[str, str]:
     """读取 xAI OIDC discovery；失败时回退到当前已知端点。"""
     fallback = {
         "device_authorization_endpoint": DEVICE_CODE_URL,
@@ -565,12 +589,14 @@ def _discover_device_endpoints(proxy: str = "", log=print) -> dict[str, str]:
     }
     last_error: BaseException | None = None
     for attempt in range(1, _DEVICE_HTTP_RETRIES + 1):
+        _check_token_cancelled(cancel_callback)
         try:
             status, payload, body = _device_http_request(
                 "GET",
                 DEVICE_DISCOVERY_URL,
                 proxy=proxy,
                 timeout=15,
+                cancel_callback=cancel_callback,
             )
             if status < 200 or status >= 300 or not isinstance(payload, dict):
                 raise RuntimeError(f"discovery HTTP {status}: {body[:160]}")
@@ -586,11 +612,13 @@ def _discover_device_endpoints(proxy: str = "", log=print) -> dict[str, str]:
                 "device_authorization_endpoint": device_endpoint,
                 "token_endpoint": token_endpoint,
             }
+        except TokenExchangeCancelled:
+            raise
         except Exception as exc:
             last_error = exc
             if attempt < _DEVICE_HTTP_RETRIES and _is_transient_device_error(exc):
                 log(f"  ⚠️ OIDC discovery 网络抖动，重试 {attempt + 1}/{_DEVICE_HTTP_RETRIES}: {exc}")
-                time.sleep(float(attempt))
+                _wait_or_stop(float(attempt), cancel_callback=cancel_callback)
                 continue
             break
     if last_error is not None:
@@ -598,9 +626,10 @@ def _discover_device_endpoints(proxy: str = "", log=print) -> dict[str, str]:
     return fallback
 
 
-def request_device_code(proxy: str = "", log=print, session=None) -> dict | None:
+def request_device_code(proxy: str = "", log=print, session=None, cancel_callback=None) -> dict | None:
     """申请 device_code / user_code（对齐 CPA；可不带 SSO）。"""
-    endpoints = _discover_device_endpoints(proxy=proxy, log=log)
+    _check_token_cancelled(cancel_callback)
+    endpoints = _discover_device_endpoints(proxy=proxy, log=log, cancel_callback=cancel_callback)
     device_endpoint = endpoints["device_authorization_endpoint"]
     s = session
     own = False
@@ -617,7 +646,10 @@ def request_device_code(proxy: str = "", log=print, session=None) -> dict | None
                     form={"client_id": CLIENT_ID, "scope": SCOPES},
                     proxy=proxy,
                     timeout=20,
+                    cancel_callback=cancel_callback,
                 )
+            except TokenExchangeCancelled:
+                raise
             except Exception as exc:
                 log(f"  ❌ device/code 异常: {exc}")
                 return None
@@ -637,6 +669,8 @@ def request_device_code(proxy: str = "", log=print, session=None) -> dict | None
                     impersonate="chrome",
                     timeout=20,
                 )
+            except TokenExchangeCancelled:
+                raise
             except Exception as exc:
                 log(f"  ❌ device/code 异常: {exc}")
                 return None
@@ -707,10 +741,11 @@ def _device_poll_limit(expires_in: int, max_wait: float | None = None) -> float:
     return float(min(expires, cap))
 
 
-def _wait_or_stop(seconds: float, stop_event=None) -> bool:
+def _wait_or_stop(seconds: float, stop_event=None, cancel_callback=None) -> bool:
     """等待 seconds 秒。stop_event 被设置时返回 False。"""
     deadline = time.time() + max(float(seconds), 0.0)
     while time.time() < deadline:
+        _check_token_cancelled(cancel_callback)
         if stop_event is not None and stop_event.is_set():
             return False
         time.sleep(min(0.2, max(deadline - time.time(), 0.0)))
@@ -731,11 +766,12 @@ def _is_transient_tls_error(exc: BaseException) -> bool:
     return any(needle in text for needle in needles)
 
 
-def _probe_sso_session(sso_cookie: str, proxy: str = "", log=print) -> bool:
+def _probe_sso_session(sso_cookie: str, proxy: str = "", log=print, cancel_callback=None) -> bool:
     """带 SSO 访问 accounts.x.ai。TLS 握手抖动时换新会话再试。"""
     last_error: BaseException | None = None
     for attempt in range(1, _SSO_PROBE_ATTEMPTS + 1):
-        session = _new_sso_session(sso_cookie, proxy=proxy)
+        _check_token_cancelled(cancel_callback)
+        session = _new_sso_session(sso_cookie, proxy=proxy, cancel_callback=cancel_callback)
         try:
             response = session.get("https://accounts.x.ai/", impersonate="chrome", timeout=15)
             final = str(getattr(response, "url", "") or "")
@@ -745,11 +781,13 @@ def _probe_sso_session(sso_cookie: str, proxy: str = "", log=print) -> bool:
                 return False
             log("  ✅ sso 有效（浏览器 Device 授权路径）")
             return True
+        except TokenExchangeCancelled:
+            raise
         except Exception as exc:
             last_error = exc
             if attempt < _SSO_PROBE_ATTEMPTS and _is_transient_tls_error(exc):
                 log(f"  ⚠️ SSO 检查网络抖动，重试一次: {exc}")
-                time.sleep(1)
+                _wait_or_stop(1, cancel_callback=cancel_callback)
                 continue
             log(f"  ❌ 网络错误: {exc}")
             return False
@@ -773,6 +811,7 @@ def poll_device_token(
     max_wait: float | None = None,
     stop_event=None,
     token_endpoint: str = "",
+    cancel_callback=None,
 ) -> dict | None:
     """轮询 device_code → access/refresh token。
 
@@ -804,6 +843,7 @@ def poll_device_token(
             grace_deadline = started_at
         last_err = ""
         while time.time() < poll_deadline:
+            _check_token_cancelled(cancel_callback)
             if stop_event is not None and stop_event.is_set():
                 log("  [*] Device Flow 轮询已停止")
                 return None
@@ -819,6 +859,7 @@ def poll_device_token(
                         },
                         proxy=proxy,
                         timeout=20,
+                        cancel_callback=cancel_callback,
                     )
                 else:
                     response = s.post(
@@ -843,13 +884,16 @@ def poll_device_token(
                         payload = response.json()
                     except Exception:
                         payload = {}
+            except TokenExchangeCancelled:
+                raise
             except Exception as e:
                 last_err = f"token 异常: {e}"
                 log(f"  ⚠️ {last_err}")
-                if not _wait_or_stop(interval, stop_event):
+                if not _wait_or_stop(interval, stop_event, cancel_callback):
                     log("  [*] Device Flow 轮询已停止")
                     return None
                 continue
+            _check_token_cancelled(cancel_callback)
             if not isinstance(payload, dict):
                 payload = {}
             err = str(payload.get("error") or "").strip()
@@ -871,21 +915,21 @@ def poll_device_token(
                 return token
             if err == "authorization_pending":
                 last_err = err
-                if not _wait_or_stop(interval, stop_event):
+                if not _wait_or_stop(interval, stop_event, cancel_callback):
                     log("  [*] Device Flow 轮询已停止")
                     return None
                 continue
             if err == "slow_down":
                 interval = min(interval + 5, 30)
                 last_err = err
-                if not _wait_or_stop(interval, stop_event):
+                if not _wait_or_stop(interval, stop_event, cancel_callback):
                     log("  [*] Device Flow 轮询已停止")
                     return None
                 continue
             if err == "invalid_grant" and time.time() < grace_deadline:
                 # 授权刚提交时服务端可能尚未落库，宽限期内按 pending 处理
                 last_err = "invalid_grant(宽限期内重试)"
-                if not _wait_or_stop(interval, stop_event):
+                if not _wait_or_stop(interval, stop_event, cancel_callback):
                     log("  [*] Device Flow 轮询已停止")
                     return None
                 continue
@@ -895,7 +939,7 @@ def poll_device_token(
                 return None
             last_err = f"HTTP {status} err={err or response_text[:120]}"
             log(f"  ⚠️ token 轮询: {last_err}")
-            if not _wait_or_stop(interval, stop_event):
+            if not _wait_or_stop(interval, stop_event, cancel_callback):
                 log("  [*] Device Flow 轮询已停止")
                 return None
         log(f"  ❌ device-flow 轮询超时/失败: {last_err}")
@@ -910,6 +954,7 @@ def sso_to_token_device_browser(
     browser_approve,
     proxy: str = "",
     log=print,
+    cancel_callback=None,
 ) -> dict | None:
     """Device Flow：HTTP 申请 code，浏览器授权与 token 轮询并行。
 
@@ -924,11 +969,11 @@ def sso_to_token_device_browser(
         log("  ❌ browser_approve 回调不可用")
         return None
 
-    if not _probe_sso_session(sso_cookie, proxy=proxy, log=log):
+    if not _probe_sso_session(sso_cookie, proxy=proxy, log=log, cancel_callback=cancel_callback):
         return None
 
     # device_code 申请不强制绑 SSO，对齐 CPA 服务端角色
-    device = request_device_code(proxy=proxy, log=log, session=None)
+    device = request_device_code(proxy=proxy, log=log, session=None, cancel_callback=cancel_callback)
     if not device:
         return None
     open_url = str(device.get("open_url") or "").strip()
@@ -953,6 +998,7 @@ def sso_to_token_device_browser(
                 max_wait=DEVICE_BROWSER_TIMEOUT_SECONDS,
                 stop_event=stop_event,
                 token_endpoint=device.get("token_endpoint", ""),
+                cancel_callback=cancel_callback,
             )
             if token:
                 token_box["token"] = token
@@ -991,7 +1037,7 @@ def sso_to_token_device_browser(
     return None
 
 
-def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
+def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print, cancel_callback=None) -> dict | None:
     """SSO cookie → token（纯协议 Device Flow + verify/approve，回退路径）。
 
     对齐 sub2api/gptGrok2api 的 /oauth2/device/verify + approve。
@@ -1003,9 +1049,11 @@ def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print) -> dic
         return None
 
     principal_id = _sso_principal_id(sso_cookie)
-    s = _new_sso_session(sso_cookie, proxy=proxy)
+    s = _new_sso_session(sso_cookie, proxy=proxy, cancel_callback=cancel_callback)
     try:
         r = s.get("https://accounts.x.ai/", impersonate="chrome", timeout=15)
+    except TokenExchangeCancelled:
+        raise
     except Exception as e:
         log(f"  ❌ 网络错误: {e}")
         return None
@@ -1015,7 +1063,7 @@ def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print) -> dic
         return None
     log("  ✅ sso 有效" + (f" principal_id={principal_id[:12]}..." if principal_id else "（协议路径）"))
 
-    device = request_device_code(proxy=proxy, log=log, session=s)
+    device = request_device_code(proxy=proxy, log=log, session=s, cancel_callback=cancel_callback)
     if not device:
         return None
     user_code = device["user_code"]
@@ -1023,6 +1071,8 @@ def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print) -> dic
     if open_url and _is_trusted_xai_url(open_url):
         try:
             s.get(open_url, impersonate="chrome", timeout=15, allow_redirects=True)
+        except TokenExchangeCancelled:
+            raise
         except Exception as e:
             log(f"  ⚠️ 打开 verification URL 失败（继续 verify）: {e}")
 
@@ -1042,6 +1092,8 @@ def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print) -> dic
             timeout=20,
             allow_redirects=True,
         )
+    except TokenExchangeCancelled:
+        raise
     except Exception as e:
         log(f"  ❌ device/verify 异常: {e}")
         return None
@@ -1084,6 +1136,8 @@ def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print) -> dic
                 timeout=20,
                 allow_redirects=True,
             )
+        except TokenExchangeCancelled:
+            raise
         except Exception as e:
             log(f"  ❌ device/approve 异常: {e}")
             return None
@@ -1111,10 +1165,11 @@ def sso_to_token_device_flow(sso_cookie: str, proxy: str = "", log=print) -> dic
         session=s,
         grace_invalid_grant=DEVICE_GRACE_PROTOCOL,
         token_endpoint=device.get("token_endpoint", ""),
+        cancel_callback=cancel_callback,
     )
 
 
-def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
+def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print, cancel_callback=None) -> dict | None:
     """SSO cookie → token（Authorization Code + PKCE，回退路径）。
 
     authorize 注入 referrer=grok-build + plan=generic，
@@ -1122,9 +1177,11 @@ def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print) -> dict 
     """
     global _working_next_action_id
 
-    s = _new_sso_session(sso_cookie, proxy=proxy)
+    s = _new_sso_session(sso_cookie, proxy=proxy, cancel_callback=cancel_callback)
     try:
         r = s.get("https://accounts.x.ai/", impersonate="chrome", timeout=15)
+    except TokenExchangeCancelled:
+        raise
     except Exception as e:
         log(f"  ❌ 网络错误: {e}")
         return None
@@ -1152,6 +1209,7 @@ def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print) -> dict 
     authorize_url = f"{OIDC_ISSUER}/oauth2/authorize?{authorize_params}"
 
     def _open_consent(discover_actions=False):
+        _check_token_cancelled(cancel_callback)
         try:
             resp = s.get(
                 authorize_url,
@@ -1159,6 +1217,8 @@ def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print) -> dict 
                 timeout=15,
                 allow_redirects=True,
             )
+        except TokenExchangeCancelled:
+            raise
         except Exception as e:
             log(f"  ❌ authorize 异常: {e}")
             return None, "", []
@@ -1231,6 +1291,7 @@ def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print) -> dict 
                 action_ids = [NEXT_ACTION_ID]
 
         for action_id in action_ids[:8]:
+            _check_token_cancelled(cancel_callback)
             if action_id in tried:
                 continue
             tried.add(action_id)
@@ -1249,6 +1310,8 @@ def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print) -> dict 
                     timeout=15,
                     allow_redirects=True,
                 )
+            except TokenExchangeCancelled:
+                raise
             except Exception as e:
                 last_err = f"consent 异常: {e}"
                 log(f"  ❌ {last_err}")
@@ -1296,6 +1359,7 @@ def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print) -> dict 
         "code_verifier": verifier,
     })
     try:
+        _check_token_cancelled(cancel_callback)
         r = s.post(
             f"{OIDC_ISSUER}/oauth2/token",
             data=token_data,
@@ -1308,6 +1372,8 @@ def sso_to_token_auth_code(sso_cookie: str, proxy: str = "", log=print) -> dict 
             impersonate="chrome",
             timeout=15,
         )
+    except TokenExchangeCancelled:
+        raise
     except Exception as e:
         log(f"  ❌ token 异常: {e}")
         return None
@@ -1354,6 +1420,7 @@ def sso_to_token(
     prefer: str = "device",
     allow_fallback: bool = True,
     browser_approve=None,
+    cancel_callback=None,
 ) -> dict | None:
     """SSO cookie → token dict。
 
@@ -1387,25 +1454,32 @@ def sso_to_token(
         if allow_fallback:
             order.append("auth_code")
 
+    exchange_options = {"proxy": proxy, "log": log}
+    if cancel_callback is not None:
+        exchange_options["cancel_callback"] = cancel_callback
+
     def _exchange_once(method: str) -> dict | None:
         if method == "device_browser":
             log("  [*] 尝试浏览器 Device Flow（继续/允许）...")
             return sso_to_token_device_browser(
-                sso_cookie, browser_approve, proxy=proxy, log=log
+                sso_cookie, browser_approve, **exchange_options
             )
         if method == "device_protocol":
             log("  [*] 尝试协议 Device Flow 换 token ...")
-            return sso_to_token_device_flow(sso_cookie, proxy=proxy, log=log)
+            return sso_to_token_device_flow(sso_cookie, **exchange_options)
         log("  [*] 尝试 Authorization Code 换 token ...")
-        return sso_to_token_auth_code(sso_cookie, proxy=proxy, log=log)
+        return sso_to_token_auth_code(sso_cookie, **exchange_options)
 
     last_label = ""
     for method in order:
+        _check_token_cancelled(cancel_callback)
         last_label = _TOKEN_METHOD_LABELS.get(method, method)
         for attempt in range(1, _TOKEN_METHOD_ATTEMPTS + 1):
+            _check_token_cancelled(cancel_callback)
             if attempt > 1:
                 log(f"  [*] {last_label} 失败，重试一次 ...")
             token = _exchange_once(method)
+            _check_token_cancelled(cancel_callback)
             if token and token.get("access_token"):
                 if attempt > 1:
                     log(f"  ✅ {last_label} 重试成功")

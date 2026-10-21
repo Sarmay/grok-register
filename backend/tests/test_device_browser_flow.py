@@ -110,6 +110,36 @@ class DevicePageActionTests(unittest.TestCase):
 
 
 class DevicePollWindowTests(unittest.TestCase):
+    def test_pending_poll_is_cancelled_during_interval_wait(self):
+        stopped = threading.Event()
+
+        def pending(*args, **kwargs):
+            stopped.set()
+            return 400, {"error": "authorization_pending"}, "{}"
+
+        with mock.patch.object(auth_exchange, "_device_http_request", side_effect=pending) as request:
+            started = time.monotonic()
+            with self.assertRaises(auth_exchange.TokenExchangeCancelled):
+                auth_exchange.poll_device_token("fixture", interval=30, cancel_callback=stopped.is_set, log=lambda *_: None)
+        self.assertLess(time.monotonic() - started, 1)
+        request.assert_called_once()
+
+    def test_stop_after_exchange_prevents_fallback(self):
+        stopped = threading.Event()
+
+        def exchange(*args, **kwargs):
+            stopped.set()
+            return None
+
+        with (
+            mock.patch.object(auth_exchange, "sso_to_token_device_flow", side_effect=exchange) as device,
+            mock.patch.object(auth_exchange, "sso_to_token_auth_code") as fallback,
+        ):
+            with self.assertRaises(auth_exchange.TokenExchangeCancelled):
+                auth_exchange.sso_to_token("fixture", cancel_callback=stopped.is_set, log=lambda *_: None)
+        device.assert_called_once()
+        fallback.assert_not_called()
+
     def test_protocol_path_keeps_the_short_cap(self):
         self.assertEqual(auth_exchange._device_poll_limit(1800), auth_exchange.DEVICE_POLL_CAP_SECONDS)
 

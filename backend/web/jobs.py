@@ -35,6 +35,7 @@ class RegistrationJobCoordinator:
         self._stop_controller = None
         self._stop_requested_before_controller = False
         self._thread: Optional[threading.Thread] = None
+        self._interrupt_thread: Optional[threading.Thread] = None
         self._started_at: Optional[float] = None
         self._finished_at: Optional[float] = None
         self._last_error = ""
@@ -155,16 +156,19 @@ class RegistrationJobCoordinator:
                     self._running = False
                     if not self._finished_at:
                         self._finished_at = time.time()
-                    self._current_stage = stage or "任务已中断（服务重启）"
+                    self._current_stage = "任务已中断（服务重启）"
                     if not self._last_error:
                         self._last_error = "服务重启，上次任务未正常收尾"
                 else:
-                    self._current_stage = stage or ("等待启动" if not batch_id else "最近任务已结束")
+                    if self._last_error.startswith("服务重启"):
+                        self._current_stage = "任务已中断（服务重启）"
+                    else:
+                        self._current_stage = stage or ("等待启动" if not batch_id else "最近任务已结束")
             elif batch_id:
                 self._current_stage = "最近任务已结束"
 
         # 若快照标记仍在 running，写回为已中断，避免下次启动重复提示逻辑混乱
-        if snap and snap.get("running"):
+        if snap and (snap.get("running") or str(snap.get("last_error") or "").startswith("服务重启")):
             self._persist_snapshot(force=True)
             if batch_id:
                 try:
@@ -302,13 +306,15 @@ class RegistrationJobCoordinator:
         from backend.registration import engine as gr
 
         self.restore_from_database()
-        gr._bs.allow_browser_launches()
         count = max(1, min(int(count or 1), 1000))
         workers = max(1, min(int(workers or 1), 8, count))
 
         with self._lock:
-            if self._running:
+            if self._running or (self._thread is not None and self._thread.is_alive()):
                 raise RuntimeError("已有注册任务在运行")
+            if self._interrupt_thread is not None and self._interrupt_thread.is_alive():
+                raise RuntimeError("上次任务的浏览器仍在清理，请稍后再试")
+            gr._bs.allow_browser_launches()
             # 批次号在这里就定下来，第一行日志起就能按批次落盘；
             # 引擎内部生成批次号时会拿回这个值，保证和账号记录一致。
             batch_id = gr.new_registration_batch_id("web")
@@ -405,16 +411,19 @@ class RegistrationJobCoordinator:
                 trace_text = gr.current_exception_traceback(gr.TRACEBACK_LOG_MAX_CHARS)
                 manager._append_log(f"[异常堆栈]\n{trace_text}")
             finally:
+                with manager._lock:
+                    interrupt_thread = manager._interrupt_thread
+                if interrupt_thread is not None:
+                    interrupt_thread.join()
                 gr.registration_log = original_registration_log
                 gr.RegistrationStopController = original_controller_cls
                 with manager._lock:
                     manager._running = False
                     manager._finished_at = time.time()
                     manager._stop_controller = None
-                    manager._stop_requested_before_controller = False
                     manager._current_stage = (
                         "任务已停止"
-                        if manager._completed_count < manager._target_count
+                        if manager._stop_requested_before_controller or manager._completed_count < manager._target_count
                         else "任务已完成"
                     )
                 manager._append_log("[*] Web 任务已结束")
@@ -434,56 +443,43 @@ class RegistrationJobCoordinator:
             finished_at = self._finished_at
             if self._last_error:
                 status = "failed"
-            elif self._completed_count < self._target_count:
+            elif self._stop_requested_before_controller or self._completed_count < self._target_count:
                 status = "stopped"
             else:
                 status = "finished"
         recorder.finish(finished_at, status, summary)
 
     def request_stop(self) -> Dict[str, Any]:
+        def interrupt_browser() -> None:
+            try:
+                from backend.registration import engine as gr
+
+                gr._bs.interrupt_browser_work(log_callback=self._append_log)
+            except Exception as exc:
+                self._append_log(f"[!] 中断浏览器启动失败: {exc}")
+
         with self._lock:
+            if not self._running or self._stop_requested_before_controller:
+                return self.status()
+            self._stop_requested_before_controller = True
             controller = self._stop_controller
-            running = self._running
-            if running and controller is None:
-                self._stop_requested_before_controller = True
-        if not running:
-            return self.status()
-        if controller is None:
-            self._append_log("[!] 已预登记停止，等待注册流程响应")
-            return self.status()
-        try:
-            controller.stop()
+            if controller is not None:
+                controller.stop()
+            self._current_stage = "停止中，等待当前操作退出"
             self._append_log("[!] 已请求停止注册任务")
-        except Exception as exc:
-            self._append_log(f"[!] 停止失败: {exc}")
-            raise
-        try:
-            from backend.registration import engine as gr
-            gr._bs.interrupt_browser_work(log_callback=self._append_log)
-        except Exception as exc:
-            self._append_log(f"[!] 中断浏览器启动失败: {exc}")
+            interrupt_thread = threading.Thread(
+                target=interrupt_browser,
+                name="registration-stop-browser",
+                daemon=True,
+            )
+            self._interrupt_thread = interrupt_thread
+            interrupt_thread.start()
+        interrupt_thread.join(timeout=0.2)
         self._persist_snapshot(force=True)
         return self.status()
 
     def stop(self) -> Dict[str, Any]:
-        status = self.request_stop()
-        if not status.get("running"):
-            return status
-        with self._lock:
-            controller = self._stop_controller
-        if controller is None:
-            deadline = time.time() + 8.0
-            while time.time() < deadline:
-                with self._lock:
-                    controller = self._stop_controller
-                    running = self._running
-                if controller is not None or not running:
-                    break
-                time.sleep(0.05)
-        if controller is None:
-            self._append_log("[!] 停止控制器仍未就绪")
-            return self.status()
-        return self.status()
+        return self.request_stop()
 
 
 job_coordinator = RegistrationJobCoordinator()
