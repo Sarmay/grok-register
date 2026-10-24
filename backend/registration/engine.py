@@ -2790,11 +2790,21 @@ def cloudflare_get_oai_code(
     )
 
 
+def choose_homepage_age(current: str = "") -> str:
+    """年龄表单只接受 20-30。已有值落在这个区间时保持不变。"""
+    text = str(current or "").strip()
+    if re.fullmatch(r"\d{1,3}", text):
+        value = int(text)
+        if 20 <= value <= 30:
+            return str(value)
+    return str(random.randint(20, 30))
+
+
 def generate_random_birthdate():
     import datetime as dt
 
     today = dt.date.today()
-    age = random.randint(20, 40)
+    age = int(choose_homepage_age())
     birth_year = today.year - age
     birth_month = random.randint(1, 12)
     birth_day = random.randint(1, 28)
@@ -3037,6 +3047,276 @@ def _open_grok_for_nsfw(page_obj, log_callback=None, cancel_callback=None) -> No
                 return
 
 
+_HOMEPAGE_AGE_LOOK_SECONDS = 8.0
+_HOMEPAGE_AGE_SUBMIT_SECONDS = 12.0
+_HOMEPAGE_AGE_INPUT = 'input[inputmode="numeric"][maxlength="3"]'
+_HOMEPAGE_NAME_INPUT = 'input[autocomplete="name"]'
+
+# 年龄页标题是 “How old are you?”，年龄框为 inputmode=numeric、maxlength=3。
+# 姓名框 autocomplete=name，提交按钮是 form 里的 Continue。
+_HOMEPAGE_AGE_PROBE_JS = r"""
+function textOf(node) {
+  return String((node && (node.innerText || node.textContent)) || '').replace(/\s+/g, ' ').trim();
+}
+function visible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const bodyText = textOf(document.body).slice(0, 500).toLowerCase();
+const title = String(document.title || '').toLowerCase();
+const challenge = title.includes('just a moment')
+  || bodyText.includes('just a moment')
+  || bodyText.includes('checking your browser');
+if (challenge) {
+  return {present: false, ready: false, challenge: true, age: '', name: '', submit: 'missing'};
+}
+const headings = Array.from(document.querySelectorAll('h1, h2')).filter(visible);
+const heading = headings.find((el) => {
+  const t = textOf(el).toLowerCase();
+  return t.includes('how old are you') || t.includes('你多大') || t.includes('你的年龄');
+});
+const main = document.querySelector('#grok-content-area') || document.body;
+const mainText = textOf(main);
+const ready = mainText.length > 60;
+if (!heading) {
+  return {present: false, ready: ready, challenge: false, age: '', name: '', submit: 'missing'};
+}
+const root = heading.closest('form') || heading.closest('section') || document;
+function fieldLabel(input) {
+  const id = input.getAttribute('id') || '';
+  if (id && window.CSS && CSS.escape) {
+    const label = document.querySelector('label[for="' + CSS.escape(id) + '"]');
+    if (label) return textOf(label).toLowerCase();
+  }
+  const block = input.parentElement && input.parentElement.parentElement;
+  const label = block && block.querySelector('label');
+  return textOf(label).toLowerCase();
+}
+const inputs = Array.from(root.querySelectorAll('input')).filter((input) => {
+  const type = (input.getAttribute('type') || 'text').toLowerCase();
+  return type !== 'hidden' && type !== 'submit' && type !== 'button' && visible(input);
+});
+let ageInput = null;
+let nameInput = null;
+for (const input of inputs) {
+  const label = fieldLabel(input);
+  const mode = (input.getAttribute('inputmode') || '').toLowerCase();
+  const auto = (input.getAttribute('autocomplete') || '').toLowerCase();
+  const maxLen = Number(input.getAttribute('maxlength') || 0);
+  if (!ageInput && (label === 'age' || label === '年龄' || (mode === 'numeric' && maxLen > 0 && maxLen <= 3))) {
+    ageInput = input;
+    continue;
+  }
+  if (!nameInput && (auto === 'name' || label === 'full name' || label === '姓名' || label === '全名')) {
+    nameInput = input;
+  }
+}
+function submitState(node) {
+  if (!node) return 'missing';
+  if (node.getAttribute('aria-busy') === 'true') return 'busy';
+  if (node.disabled || node.getAttribute('aria-disabled') === 'true') return 'disabled';
+  const cls = String(node.className || '');
+  if (cls.includes('pointer-events-none')) return 'disabled';
+  return 'enabled';
+}
+const buttons = Array.from(root.querySelectorAll('button, input[type="submit"]')).filter(visible);
+const submit = buttons.find((node) => {
+  const t = textOf(node).toLowerCase().replace(/\s+/g, '');
+  if (t.includes('signout') || t.includes('退出') || t.includes('登出')) return false;
+  return node.getAttribute('type') === 'submit' || t === 'continue' || t.includes('continue') || t === '继续';
+});
+return {
+  present: true,
+  ready: true,
+  challenge: false,
+  age: ageInput ? String(ageInput.value || '') : '',
+  name: nameInput ? String(nameInput.value || '') : '',
+  submit: submitState(submit),
+};
+"""
+
+_HOMEPAGE_AGE_SET_JS = r"""
+const selector = arguments[0];
+const value = String(arguments[1] == null ? '' : arguments[1]);
+const el = document.querySelector(selector);
+if (!el) return false;
+el.focus();
+const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+if (el._valueTracker) el._valueTracker.setValue('');
+if (proto && proto.set) proto.set.call(el, value);
+else el.value = value;
+el.dispatchEvent(new InputEvent('input', {bubbles: true, data: value, inputType: 'insertText'}));
+el.dispatchEvent(new Event('change', {bubbles: true}));
+return String(el.value || '') === value;
+"""
+
+_HOMEPAGE_AGE_CLICK_JS = r"""
+function textOf(node) {
+  return String((node && (node.innerText || node.textContent)) || '').replace(/\s+/g, ' ').trim();
+}
+function visible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const heading = Array.from(document.querySelectorAll('h1, h2')).find((el) => {
+  const t = textOf(el).toLowerCase();
+  return visible(el) && (t.includes('how old are you') || t.includes('你多大') || t.includes('你的年龄'));
+});
+const root = (heading && (heading.closest('form') || heading.closest('section'))) || document;
+const button = Array.from(root.querySelectorAll('button, input[type="submit"]')).find((node) => {
+  if (!visible(node)) return false;
+  if (node.disabled || node.getAttribute('aria-disabled') === 'true' || node.getAttribute('aria-busy') === 'true') return false;
+  const t = textOf(node).toLowerCase().replace(/\s+/g, '');
+  if (t.includes('signout') || t.includes('退出') || t.includes('登出')) return false;
+  return node.getAttribute('type') === 'submit' || t === 'continue' || t.includes('continue') || t === '继续';
+});
+if (!button) return false;
+const form = button.closest('form');
+if (form && typeof form.requestSubmit === 'function') {
+  form.requestSubmit(button);
+  return true;
+}
+button.click();
+return true;
+"""
+
+
+def _probe_homepage_age(page_obj):
+    try:
+        state = page_obj.run_js(_HOMEPAGE_AGE_PROBE_JS)
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _registration_full_name() -> str:
+    profile = _rf.last_profile()
+    parts = [
+        str(profile.get("given_name") or "").strip(),
+        str(profile.get("family_name") or "").strip(),
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def _set_homepage_field(page_obj, selector: str, value: str) -> bool:
+    """先用 Playwright 写入，让 React 受控输入收到 input 事件；失败再退回原生 setter。"""
+    raw = getattr(page_obj, "raw_page", None)
+    if raw is not None and callable(getattr(type(raw), "locator", None)):
+        try:
+            raw.locator(selector).first.fill(str(value), timeout=2000)
+            return True
+        except Exception:
+            pass
+    try:
+        return bool(page_obj.run_js(_HOMEPAGE_AGE_SET_JS, selector, value))
+    except Exception:
+        return False
+
+
+def _read_homepage_age_form(page_obj, timeout: float, cancel_callback=None):
+    """等到年龄表单出现。首页已经渲染成正常内容时再结束等待。"""
+    started = time.monotonic()
+    deadline = started + timeout
+    ready_hits = 0
+    while True:
+        raise_if_cancelled(cancel_callback)
+        state = _probe_homepage_age(page_obj)
+        if state.get("challenge"):
+            return None
+        if state.get("present"):
+            return state
+        if state.get("ready"):
+            ready_hits += 1
+            # 年龄表单可能比首页壳晚一点挂上，至少看过 1.2 秒再认定没有。
+            if ready_hits >= 2 and time.monotonic() - started >= 1.2:
+                return None
+        else:
+            ready_hits = 0
+        if time.monotonic() >= deadline:
+            return None
+        sleep_with_cancel(0.4, cancel_callback)
+
+
+def _complete_homepage_age_form(page_obj, state, log_callback=None, cancel_callback=None) -> str:
+    chosen = choose_homepage_age(str(state.get("age") or ""))
+    fallback_name = _registration_full_name()
+    name_attempted = False
+    clicks = 0
+    saw_busy = str(state.get("submit") or "") == "busy"
+    if log_callback:
+        log_callback(f"[*] grok 首页出现年龄确认，填写 {chosen} 并提交")
+    deadline = time.monotonic() + _HOMEPAGE_AGE_SUBMIT_SECONDS
+    while True:
+        raise_if_cancelled(cancel_callback)
+        if "present" in state and not state.get("present"):
+            if log_callback:
+                if clicks or saw_busy:
+                    log_callback(f"[*] 已提交 grok 首页年龄确认: {chosen}")
+                else:
+                    log_callback(f"[*] grok 首页年龄确认已关闭: {chosen}")
+            return "submitted" if clicks or saw_busy else "closed"
+        age_now = str(state.get("age") or "").strip()
+        name_now = str(state.get("name") or "").strip()
+        submit = str(state.get("submit") or "")
+        if submit == "busy":
+            saw_busy = True
+        elif age_now != chosen:
+            _set_homepage_field(page_obj, _HOMEPAGE_AGE_INPUT, chosen)
+        elif not name_now and fallback_name and not name_attempted:
+            name_attempted = True
+            _set_homepage_field(page_obj, _HOMEPAGE_NAME_INPUT, fallback_name)
+        elif submit == "enabled" and clicks < 2:
+            try:
+                clicked = bool(page_obj.run_js(_HOMEPAGE_AGE_CLICK_JS))
+            except Exception:
+                clicked = False
+            if clicked:
+                clicks += 1
+        if time.monotonic() >= deadline:
+            break
+        sleep_with_cancel(0.4, cancel_callback)
+        state = _probe_homepage_age(page_obj)
+    if log_callback:
+        if saw_busy or clicks:
+            log_callback(f"[!] 年龄确认提交后页面仍停留在表单，继续后续步骤: {chosen}")
+        else:
+            log_callback(f"[!] 年龄确认未能提交，继续后续步骤: {chosen}")
+    return "stuck"
+
+
+def submit_homepage_age_if_present(page_obj=None, log_callback=None, cancel_callback=None) -> str:
+    """注册后的 grok 首页偶尔要求填写年龄。出现时填 20-30 并提交。"""
+    target = page_obj or _active_page()
+    if target is None or not _is_grok_url(getattr(target, "url", "")):
+        return "skip"
+    try:
+        state = _read_homepage_age_form(
+            target,
+            _HOMEPAGE_AGE_LOOK_SECONDS,
+            cancel_callback=cancel_callback,
+        )
+        if not state:
+            return "absent"
+        return _complete_homepage_age_form(
+            target,
+            state,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+    except RegistrationCancelled:
+        raise
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 年龄确认处理异常，继续后续步骤: {exc}")
+        return "error"
+
+
 def enable_nsfw_via_browser(token="", log_callback=None, cancel_callback=None):
     """在已登录的注册浏览器内调用 grok.com 接口，绕过外部 HTTP 的 CF 拦截。"""
     page_obj = _active_page()
@@ -3099,6 +3379,11 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
             if log_callback:
                 log_callback("[!] grok.com 仍停在 Cloudflare 挑战页，浏览器内 NSFW 可能失败")
         sleep_with_cancel(1.0, cancel_callback)
+        submit_homepage_age_if_present(
+            page_obj,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
 
         result = page_obj.run_js(
             r"""
@@ -3633,6 +3918,10 @@ def run_registration(count):
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
+                        submit_homepage_age_if_present(
+                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                            cancel_callback=controller.should_stop,
+                        )
                         ensure_sso_oauth_eligible(
                             sso,
                             email=email,
@@ -4067,6 +4356,9 @@ def run_registration(count):
                 registration_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
                 registration_log("[*] 5. 等待 sso cookie")
                 sso = wait_for_sso_cookie(
+                    log_callback=registration_log, cancel_callback=controller.should_stop
+                )
+                submit_homepage_age_if_present(
                     log_callback=registration_log, cancel_callback=controller.should_stop
                 )
                 ensure_sso_oauth_eligible(

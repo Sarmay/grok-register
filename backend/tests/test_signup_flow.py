@@ -149,6 +149,108 @@ class SignupFlowTests(unittest.TestCase):
             engine._open_grok_for_nsfw(page)
         self.assertEqual(page.get.call_count, 2)
 
+    def test_homepage_age_keeps_values_inside_20_to_30(self):
+        for current in ("20", "30", " 27 "):
+            self.assertEqual(engine.choose_homepage_age(current), current.strip())
+        with mock.patch.object(engine.random, "randint", return_value=24) as pick:
+            for current in ("", "19", "31", "abc", "7"):
+                self.assertEqual(engine.choose_homepage_age(current), "24")
+        self.assertEqual(pick.call_args_list[0].args, (20, 30))
+
+    def _age_page(self, probes):
+        page = mock.Mock()
+        page.url = "https://grok.com/"
+        actions = []
+
+        def run_js(script, *args):
+            if "_valueTracker" in script:
+                actions.append(("set", args))
+                return True
+            if "requestSubmit" in script:
+                actions.append(("click", args))
+                return True
+            if "how old are you" in script:
+                if not probes:
+                    raise AssertionError("unexpected extra age probe")
+                return probes.pop(0)
+            raise AssertionError(script[:120])
+
+        page.run_js.side_effect = run_js
+        page.actions = actions
+        return page
+
+    def test_homepage_age_skips_when_not_on_grok(self):
+        page = mock.Mock()
+        page.url = "https://accounts.x.ai/sign-up"
+        self.assertEqual(engine.submit_homepage_age_if_present(page), "skip")
+        page.run_js.assert_not_called()
+
+    def test_homepage_age_returns_when_home_has_no_form(self):
+        ready = {
+            "present": False,
+            "ready": True,
+            "challenge": False,
+            "age": "",
+            "name": "",
+            "submit": "missing",
+        }
+        page = self._age_page([dict(ready) for _ in range(8)])
+        self.assertEqual(engine.submit_homepage_age_if_present(page), "absent")
+        self.assertEqual(page.actions, [])
+
+    def test_homepage_age_fills_and_submits(self):
+        page = self._age_page([
+            {"present": True, "ready": True, "challenge": False, "age": "", "name": "Aiden Wu", "submit": "disabled"},
+            {"present": True, "ready": True, "challenge": False, "age": "24", "name": "Aiden Wu", "submit": "enabled"},
+            {"present": False, "ready": True, "challenge": False, "age": "", "name": "", "submit": "missing"},
+        ])
+        logs = []
+        with mock.patch.object(engine.random, "randint", return_value=24):
+            result = engine.submit_homepage_age_if_present(page, log_callback=logs.append)
+        self.assertEqual(result, "submitted")
+        self.assertEqual(page.actions, [("set", (engine._HOMEPAGE_AGE_INPUT, "24")), ("click", ())])
+        self.assertTrue(any("填写 24 并提交" in line for line in logs))
+        self.assertTrue(any("已提交 grok 首页年龄确认: 24" in line for line in logs))
+
+    def test_homepage_age_keeps_existing_age_and_fills_empty_name(self):
+        page = self._age_page([
+            {"present": True, "ready": True, "challenge": False, "age": "27", "name": "", "submit": "disabled"},
+            {"present": True, "ready": True, "challenge": False, "age": "27", "name": "Aiden Wu", "submit": "enabled"},
+            {"present": False, "ready": True, "challenge": False, "age": "", "name": "", "submit": "missing"},
+        ])
+        with mock.patch.object(
+            engine._rf,
+            "last_profile",
+            return_value={"given_name": "Aiden", "family_name": "Wu"},
+        ):
+            result = engine.submit_homepage_age_if_present(page)
+        self.assertEqual(result, "submitted")
+        self.assertEqual(
+            page.actions,
+            [
+                ("set", (engine._HOMEPAGE_NAME_INPUT, "Aiden Wu")),
+                ("click", ()),
+            ],
+        )
+
+    def test_homepage_age_waits_out_an_in_flight_submit(self):
+        page = self._age_page([
+            {"present": True, "ready": True, "challenge": False, "age": "30", "name": "Aiden Wu", "submit": "busy"},
+            {"present": False, "ready": True, "challenge": False, "age": "", "name": "", "submit": "missing"},
+        ])
+        logs = []
+        result = engine.submit_homepage_age_if_present(page, log_callback=logs.append)
+        self.assertEqual(result, "submitted")
+        self.assertEqual(page.actions, [])
+        self.assertTrue(any("已提交 grok 首页年龄确认: 30" in line for line in logs))
+
+    def test_homepage_age_stops_when_registration_is_cancelled(self):
+        page = mock.Mock()
+        page.url = "https://grok.com/"
+        with self.assertRaises(engine.RegistrationCancelled):
+            engine.submit_homepage_age_if_present(page, cancel_callback=lambda: True)
+        page.run_js.assert_not_called()
+
     def test_detects_account_already_registered_notice(self):
         page = mock.Mock()
         page.run_js.return_value = {
