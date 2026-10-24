@@ -102,6 +102,16 @@ class Grok2APIClient:
                 selected.append(format_name)
         return tuple(selected)
 
+    @classmethod
+    def initial_enabled(cls, config: Mapping[str, Any] | None = None) -> bool:
+        """新建账号是否立刻进入 grok2api 调度。
+
+        开启 GrokIQ 联动时先停用。检测开着就等探针通过后再启用；
+        检测关掉时，GrokIQ 收到导入事件后会马上启用。重复导入不会改已有账号的启用状态。
+        """
+
+        return not bool((config or {}).get("grokiq_webhook_enabled"))
+
     @property
     def access_token(self) -> str:
         """只读暴露当前会话令牌，便于诊断是否已登录。"""
@@ -209,6 +219,8 @@ class Grok2APIClient:
         self,
         file_path: str | Path,
         format_name: str = "grok_build",
+        *,
+        initial_enabled: bool = True,
     ) -> Dict[str, Any]:
         """自动登录并将一个 grok_build JSON 导入远程管理端。"""
         normalized_format = str(format_name or "").strip().lower() or "grok_build"
@@ -219,6 +231,9 @@ class Grok2APIClient:
             )
         path, content = self._load_auth_document(file_path)
         token = self.login()
+        import_url = f"{self.base_url}{import_path}"
+        if not initial_enabled:
+            import_url = f"{import_url}?initialEnabled=false"
         multipart = CurlMime()
         multipart.addpart(
             name="files",
@@ -239,9 +254,7 @@ class Grok2APIClient:
                 "stream": True,
             }
             try:
-                response = self.session.post(
-                    f"{self.base_url}{import_path}", **request_kwargs
-                )
+                response = self.session.post(import_url, **request_kwargs)
             except TypeError as exc:
                 if "multipart" not in str(exc):
                     raise
@@ -249,9 +262,7 @@ class Grok2APIClient:
                 request_kwargs["files"] = {
                     "files": (path.name, content, "application/json")
                 }
-                response = self.session.post(
-                    f"{self.base_url}{import_path}", **request_kwargs
-                )
+                response = self.session.post(import_url, **request_kwargs)
         except Exception as exc:
             raise Grok2APIImportError(f"连接 Grok2API 导入接口失败: {exc}") from exc
         finally:

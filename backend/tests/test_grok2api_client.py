@@ -104,11 +104,43 @@ class Grok2APIClientTests(unittest.TestCase):
             path.write_text(json.dumps({"provider": "grok_build"}), encoding="utf-8")
             result = client.import_auth_file(path)
         self.assertEqual(result["created"], 1)
+        self.assertEqual(
+            session.calls[1][0], "https://example.test/api/admin/v1/accounts/import"
+        )
         self.assertIn("multipart", session.calls[1][1])
         self.assertEqual(
             session.calls[1][1]["headers"]["Authorization"], "Bearer fresh-token"
         )
         self.assertTrue(import_response.closed)
+
+    def test_import_can_create_accounts_disabled_until_grokiq(self):
+        session = FakeSession(
+            [
+                FakeResponse(payload={"data": {"tokens": {"accessToken": "fresh-token"}}}),
+                FakeResponse(
+                    lines=[
+                        b"event: complete",
+                        b'data: {"created":1,"updated":0}',
+                        b"",
+                    ]
+                ),
+            ]
+        )
+        client = Grok2APIClient(
+            "https://example.test", "admin", "secret", session=session
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g2a-fixture.json"
+            path.write_text("{}", encoding="utf-8")
+            client.import_auth_file(path, initial_enabled=False)
+        self.assertEqual(
+            session.calls[1][0],
+            "https://example.test/api/admin/v1/accounts/import?initialEnabled=false",
+        )
+        self.assertTrue(Grok2APIClient.initial_enabled({}))
+        self.assertFalse(
+            Grok2APIClient.initial_enabled({"grokiq_webhook_enabled": True})
+        )
 
     def test_import_surfaces_sse_error(self):
         session = FakeSession(
@@ -255,6 +287,7 @@ class Grok2APIAutoImportEngineTests(unittest.TestCase):
         )
         self.assertEqual(calls[0].args[0], bundle["grok_build"])
         self.assertEqual(calls[1].args[0], bundle["grok_console"])
+        self.assertTrue(all(call.kwargs.get("initial_enabled") for call in calls))
 
 
 if __name__ == "__main__":

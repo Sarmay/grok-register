@@ -2135,7 +2135,11 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None, canc
                                     continue
                                 try:
                                     remote_result = client.import_auth_file(
-                                        format_path, format_name=format_name
+                                        format_path,
+                                        format_name=format_name,
+                                        initial_enabled=_grok2api.Grok2APIClient.initial_enabled(
+                                            config
+                                        ),
                                     )
                                     remote_results[format_name] = remote_result
                                     _cpa_log(

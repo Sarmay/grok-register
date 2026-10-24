@@ -1290,7 +1290,9 @@ def create_app() -> FastAPI:
                 for format_name, path in paths.items():
                     try:
                         results[format_name] = client.import_auth_file(
-                            path, format_name=format_name
+                            path,
+                            format_name=format_name,
+                            initial_enabled=Grok2APIClient.initial_enabled(gr.config),
                         )
                     except Grok2APIImportError as exc:
                         errors[format_name] = str(exc)
