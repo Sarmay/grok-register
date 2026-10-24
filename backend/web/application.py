@@ -78,6 +78,7 @@ CONFIG_PUBLIC_KEYS = (
     "enable_nsfw",
     "debug_mode",
     "browser_engine",
+    "antbrowser_source_code",
     "browser_headless",
     "browser_locale",
     "browser_low_traffic_mode",
@@ -408,8 +409,13 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
                 value = "en-US"
         elif key == "browser_engine":
             value = str(value or "camoufox").strip().lower()
-            if value not in {"camoufox", "cloakbrowser"}:
+            if value not in {"camoufox", "cloakbrowser", "antbrowser"}:
                 value = "camoufox"
+        elif key == "antbrowser_source_code":
+            value = str(value or "HXI2F1").strip().upper()
+            allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+            if not (4 <= len(value) <= 32 and all(char in allowed for char in value)):
+                value = "HXI2F1"
         elif key == "browser_traffic_savings_level":
             value = str(value or "standard").strip().lower()
             if value in {"standard", "less", "light"}:

@@ -28,6 +28,7 @@
   "enable_nsfw": true,
   "debug_mode": false,
   "browser_engine": "camoufox",
+  "antbrowser_source_code": "HXI2F1",
   "browser_headless": false,
   "browser_locale": "en-US",
   "browser_low_traffic_mode": true,

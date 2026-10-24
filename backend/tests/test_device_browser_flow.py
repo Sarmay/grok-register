@@ -6,9 +6,11 @@ import unittest
 from unittest import mock
 
 from backend.integrations import auth_exchange
+from backend.registration import signup_flow
 from backend.registration.signup_flow import (
     DEVICE_BROWSER_TIMEOUT_SECONDS,
     _click_device_button_exact,
+    authorize_device_in_browser,
     device_cookie_banner_visible,
     next_device_approval_action,
 )
@@ -57,6 +59,31 @@ class DevicePageActionTests(unittest.TestCase):
             "click-allow",
         )
 
+    def test_chinese_allow_with_english_value_is_click_allow(self):
+        buttons = [
+            "SpaceXSI account home link",
+            "退出登录 退出登录",
+            "拒绝 拒绝 deny",
+            "允许 允许 allow",
+        ]
+        self.assertEqual(
+            next_device_approval_action(
+                "https://accounts.x.ai/oauth2/device/consent?user_code=Z5ZE-FGAJ",
+                "授权 Grok Build",
+                buttons,
+            ),
+            "click-allow",
+        )
+        self.assertEqual(
+            next_device_approval_action(
+                "https://accounts.x.ai/oauth2/device/consent",
+                "Authorize Grok Build",
+                ["Allow all"],
+                ignore_cookie=True,
+            ),
+            "wait",
+        )
+
     def test_exact_allow_is_not_the_cookie_button(self):
         body = "Authorize Grok Build\nCookie Policy"
         buttons = ["Allow", "Deny", "Cookie Policy"]
@@ -89,6 +116,47 @@ class DevicePageActionTests(unittest.TestCase):
             next_device_approval_action("https://auth.x.ai/oauth2/device/approve", "", []),
             "reload",
         )
+        self.assertEqual(
+            next_device_approval_action(
+                "https://auth.x.ai/oauth2/device/approve",
+                "Enter the code again",
+                ["Enter the code again"],
+            ),
+            "reload",
+        )
+
+    def test_enter_the_code_again_abandons_the_current_code(self):
+        class _Wait:
+            def doc_loaded(self):
+                return None
+
+        class _Page:
+            def __init__(self):
+                self.gets = []
+                self.url = ""
+                self.wait = _Wait()
+
+            def get(self, url):
+                self.gets.append(url)
+                self.url = url
+
+            def run_js(self, script, user_code=None):
+                return {
+                    "url": "https://auth.x.ai/oauth2/device/approve",
+                    "body": "Enter the code again",
+                    "buttons": ["Enter the code again"],
+                }
+
+        page = _Page()
+        with mock.patch.object(signup_flow, "_sleep_device", return_value=True):
+            with self.assertRaises(auth_exchange.DeviceUserCodeRejected):
+                authorize_device_in_browser(
+                    "7AVG-CGXF",
+                    "https://accounts.x.ai/oauth2/device?user_code=7AVG-CGXF",
+                    page_obj=page,
+                    log_callback=lambda *_args, **_kwargs: None,
+                )
+        self.assertEqual(page.gets, ["https://accounts.x.ai/oauth2/device?user_code=7AVG-CGXF"])
 
     def test_done_page_and_login_redirect(self):
         self.assertEqual(
@@ -253,6 +321,76 @@ class DeviceBrowserExchangeTests(unittest.TestCase):
 
         self.assertIsNone(token)
 
+    def _device_for(self, user_code):
+        device = self._device()
+        device["device_code"] = user_code
+        device["user_code"] = user_code
+        device["open_url"] = f"https://accounts.x.ai/oauth2/device?user_code={user_code}"
+        return device
+
+    def test_rejected_code_is_regenerated_up_to_three_times(self):
+        codes = ["CODE-1", "CODE-2", "CODE-3"]
+        requested = []
+
+        def request_device_code(*_args, **_kwargs):
+            user_code = codes[len(requested)]
+            requested.append(user_code)
+            return self._device_for(user_code)
+
+        def approve(user_code, open_url, stop_event=None):
+            raise auth_exchange.DeviceUserCodeRejected(user_code)
+
+        def poll(*_args, **kwargs):
+            kwargs["stop_event"].set()
+            return None
+
+        with (
+            mock.patch.object(auth_exchange, "_probe_sso_session", return_value=True),
+            mock.patch.object(auth_exchange, "request_device_code", side_effect=request_device_code),
+            mock.patch.object(auth_exchange, "poll_device_token", side_effect=poll),
+        ):
+            with self.assertRaises(auth_exchange.DeviceBrowserCodesExhausted):
+                auth_exchange.sso_to_token_device_browser(
+                    "sso-cookie",
+                    approve,
+                    log=lambda *_args, **_kwargs: None,
+                )
+
+        self.assertEqual(requested, codes)
+
+    def test_second_code_can_still_return_a_token(self):
+        issued = []
+
+        def request_device_code(*_args, **_kwargs):
+            user_code = "CODE-2" if issued else "CODE-1"
+            issued.append(user_code)
+            return self._device_for(user_code)
+
+        def approve(user_code, open_url, stop_event=None):
+            if user_code == "CODE-1":
+                raise auth_exchange.DeviceUserCodeRejected(user_code)
+            return True
+
+        def poll(device_code, *_args, **kwargs):
+            if device_code == "CODE-1":
+                return None
+            kwargs["stop_event"].set()
+            return {"access_token": "tok", "refresh_token": "refresh"}
+
+        with (
+            mock.patch.object(auth_exchange, "_probe_sso_session", return_value=True),
+            mock.patch.object(auth_exchange, "request_device_code", side_effect=request_device_code),
+            mock.patch.object(auth_exchange, "poll_device_token", side_effect=poll),
+        ):
+            token = auth_exchange.sso_to_token_device_browser(
+                "sso-cookie",
+                approve,
+                log=lambda *_args, **_kwargs: None,
+            )
+
+        self.assertEqual(issued, ["CODE-1", "CODE-2"])
+        self.assertEqual(token["access_token"], "tok")
+
     def test_tls_probe_retries_then_accepts_sso(self):
         calls = {"count": 0}
 
@@ -303,6 +441,34 @@ class DeviceBrowserExchangeTests(unittest.TestCase):
                 log=lambda *_args, **_kwargs: None,
             )
         self.assertEqual(calls, ["browser", "browser", "auth_code"])
+        self.assertEqual(token["access_token"], "tok")
+
+    def test_exhausted_browser_codes_switch_to_protocol(self):
+        calls = []
+
+        def browser(*_args, **_kwargs):
+            calls.append("browser")
+            raise auth_exchange.DeviceBrowserCodesExhausted("tried 3")
+
+        def protocol(*_args, **_kwargs):
+            calls.append("protocol")
+            return {"access_token": "tok"}
+
+        def auth_code(*_args, **_kwargs):
+            calls.append("auth_code")
+            return {"access_token": "other"}
+
+        with (
+            mock.patch.object(auth_exchange, "sso_to_token_device_browser", side_effect=browser),
+            mock.patch.object(auth_exchange, "sso_to_token_device_flow", side_effect=protocol),
+            mock.patch.object(auth_exchange, "sso_to_token_auth_code", side_effect=auth_code),
+        ):
+            token = auth_exchange.sso_to_token(
+                "sso-cookie",
+                browser_approve=lambda *_args, **_kwargs: False,
+                log=lambda *_args, **_kwargs: None,
+            )
+        self.assertEqual(calls, ["browser", "protocol"])
         self.assertEqual(token["access_token"], "tok")
 
 

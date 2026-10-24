@@ -122,10 +122,16 @@ class ProxyConfigUpdateTests(unittest.TestCase):
     def test_browser_engine_accepts_cloakbrowser_and_falls_back_to_camoufox(self):
         with patch.object(gr, "load_config"), patch.object(gr, "save_config"):
             selected = _apply_config_updates({"browser_engine": "cloakbrowser"})
+            antbrowser = _apply_config_updates({"browser_engine": "antbrowser"})
             fallback = _apply_config_updates({"browser_engine": "unknown"})
 
         self.assertEqual(selected["config"]["browser_engine"], "cloakbrowser")
+        self.assertEqual(antbrowser["config"]["browser_engine"], "antbrowser")
         self.assertEqual(fallback["config"]["browser_engine"], "camoufox")
+        source = _apply_config_updates({"antbrowser_source_code": "hxi2f1"})
+        invalid = _apply_config_updates({"antbrowser_source_code": "bad code"})
+        self.assertEqual(source["config"]["antbrowser_source_code"], "HXI2F1")
+        self.assertEqual(invalid["config"]["antbrowser_source_code"], "HXI2F1")
 
 
 if __name__ == "__main__":

@@ -341,6 +341,7 @@ DEFAULT_CONFIG = {
     "browser_engine": _bs.normalize_browser_engine(
         os.environ.get("GROK_BROWSER_ENGINE", "camoufox")
     ),
+    "antbrowser_source_code": "HXI2F1",
     "browser_headless": False,
     "browser_locale": "en-US",
     "browser_low_traffic_mode": True,
@@ -3274,6 +3275,14 @@ def get_browser_engine() -> str:
     return _bs.normalize_browser_engine(config.get("browser_engine", "camoufox"))
 
 
+def get_antbrowser_source_code() -> str:
+    value = str(config.get("antbrowser_source_code") or "HXI2F1").strip().upper()
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+    if not (4 <= len(value) <= 32 and all(char in allowed for char in value)):
+        return "HXI2F1"
+    return value
+
+
 def get_browser_locale() -> str:
     value = str(config.get("browser_locale", "en-US") or "en-US").strip()
     return value if value in {"en-US", "zh-CN"} else "en-US"
@@ -3335,6 +3344,7 @@ def _wire_runtime_modules():
         is_headless=is_browser_headless,
         get_locale=get_browser_locale,
         get_engine=get_browser_engine,
+        get_antbrowser_source_code=get_antbrowser_source_code,
         is_low_traffic=is_browser_low_traffic_mode,
         get_traffic_savings_level=get_browser_traffic_savings_level,
         extension_path=EXTENSION_PATH,
@@ -3888,10 +3898,13 @@ def run_registration(count):
                         )
                         registration_log(f"[W{wid+1}] [-] 失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                     finally:
-                        if i < n and not controller.should_stop():
+                        # Ant Browser 每号用完就停掉并删除，下一号启动时再复制新实例。
+                        recycle_antbrowser = get_browser_engine() == _bs.BROWSER_ENGINE_ANTBROWSER
+                        if not controller.should_stop() and (i < n or recycle_antbrowser):
                             try:
                                 stop_browser()
-                                time.sleep(0.3)
+                                if i < n:
+                                    time.sleep(0.3)
                             except Exception:
                                 pass
             finally:
@@ -4320,22 +4333,24 @@ def run_registration(count):
                     break
                 # 每轮结束只关浏览器，不立刻再开。
                 # 下一轮 open_signup_page 会按需启动并导航到官网，避免空浏览器残留。
-                if i >= count:
-                    continue
-                # 账号间随机间隔
-                wait_sec = parse_account_interval()
-                if wait_sec > 0:
-                    registration_log(f"[*] 下一个账号前等待 {wait_sec:.0f} 秒...")
-                    sleep_with_cancel(wait_sec, controller.should_stop)
-                try:
-                    stop_browser()
-                    time.sleep(0.5)
-                except RegistrationCancelled:
-                    break
-                except Exception as close_exc:
-                    if controller.should_stop():
+                # Ant Browser 成功或进入下一号前都要停掉并删除刚用过的复制实例。
+                recycle_antbrowser = get_browser_engine() == _bs.BROWSER_ENGINE_ANTBROWSER
+                if i < count:
+                    wait_sec = parse_account_interval()
+                    if wait_sec > 0:
+                        registration_log(f"[*] 下一个账号前等待 {wait_sec:.0f} 秒...")
+                        sleep_with_cancel(wait_sec, controller.should_stop)
+                if i < count or recycle_antbrowser:
+                    try:
+                        stop_browser()
+                        if i < count:
+                            time.sleep(0.5)
+                    except RegistrationCancelled:
                         break
-                    registration_log(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
+                    except Exception as close_exc:
+                        if controller.should_stop():
+                            break
+                        registration_log(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
     except RegistrationCancelled:
         registration_log("[!] 注册被停止")
     except Exception as exc:

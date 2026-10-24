@@ -41,6 +41,8 @@ DEVICE_DEFAULT_EXPIRES = 1800
 DEVICE_POLL_CAP_SECONDS = 90
 # 浏览器授权与 token 轮询并行，单次尝试的上限。协议路径仍用 DEVICE_POLL_CAP_SECONDS。
 DEVICE_BROWSER_TIMEOUT_SECONDS = 180
+# 点允许后页面要求重新输入授权码时，重新申请 user_code 的次数上限。
+DEVICE_BROWSER_CODE_ATTEMPTS = 3
 # 浏览器点完「允许」后，服务端落库可能有延迟；协议路径 approve 多半无效，快速回退
 DEVICE_GRACE_BROWSER = 60
 DEVICE_GRACE_PROTOCOL = 10
@@ -348,6 +350,14 @@ def _discover_action_ids_from_js(session, html: str, base_url: str = "https://ac
 
 class TokenExchangeCancelled(Exception):
     """调用方要求停止授权交换。"""
+
+
+class DeviceUserCodeRejected(Exception):
+    """当前 user_code 被页面拒绝，需要重新申请授权码。"""
+
+
+class DeviceBrowserCodesExhausted(Exception):
+    """浏览器 Device Flow 已用完重新申请授权码的次数。"""
 
 
 def _check_token_cancelled(cancel_callback=None):
@@ -949,41 +959,22 @@ def poll_device_token(
         pass
 
 
-def sso_to_token_device_browser(
-    sso_cookie: str,
+def _approve_one_device_code(
+    device: dict,
     browser_approve,
     proxy: str = "",
     log=print,
     cancel_callback=None,
 ) -> dict | None:
-    """Device Flow：HTTP 申请 code，浏览器授权与 token 轮询并行。
+    """用一个 user_code 做浏览器授权，并与 token 轮询并行。
 
-    browser_approve(user_code, open_url, stop_event=None) -> bool
-    轮询拿到 access_token 时置位 stop_event。页面没到 done 不算成功。
+    页面要求重新输入授权码时抛出 DeviceUserCodeRejected。
+    轮询已经拿到 token 时直接返回，不再换码。
     """
-    sso_cookie = str(sso_cookie or "").strip()
-    if not sso_cookie:
-        log("  ❌ sso 为空")
-        return None
-    if not callable(browser_approve):
-        log("  ❌ browser_approve 回调不可用")
-        return None
-
-    if not _probe_sso_session(sso_cookie, proxy=proxy, log=log, cancel_callback=cancel_callback):
-        return None
-
-    # device_code 申请不强制绑 SSO，对齐 CPA 服务端角色
-    device = request_device_code(proxy=proxy, log=log, session=None, cancel_callback=cancel_callback)
-    if not device:
-        return None
     open_url = str(device.get("open_url") or "").strip()
-    if open_url and not _is_trusted_xai_url(open_url):
-        log(f"  ❌ verification URL 不受信: {open_url[:120]}")
-        return None
-    log(f"  [*] 浏览器授权: {open_url[:120]}")
-
     stop_event = threading.Event()
     token_box: dict = {}
+    rejected = False
 
     def _poll() -> None:
         try:
@@ -1015,6 +1006,11 @@ def sso_to_token_device_browser(
             browser_done = bool(
                 browser_approve(device["user_code"], open_url, stop_event=stop_event)
             )
+        except DeviceUserCodeRejected:
+            rejected = True
+            browser_done = False
+        except TokenExchangeCancelled:
+            raise
         except Exception as exc:
             log(f"  ❌ 浏览器授权异常: {exc}")
             browser_done = False
@@ -1030,10 +1026,74 @@ def sso_to_token_device_browser(
     token = token_box.get("token")
     if token:
         return token
+    if rejected:
+        raise DeviceUserCodeRejected(str(device.get("user_code") or ""))
     if not browser_done:
         log("  ❌ 浏览器未完成 Device 授权")
     else:
         log("  ❌ 浏览器 Device Flow 未取得 token")
+    return None
+
+
+def sso_to_token_device_browser(
+    sso_cookie: str,
+    browser_approve,
+    proxy: str = "",
+    log=print,
+    cancel_callback=None,
+) -> dict | None:
+    """Device Flow：HTTP 申请 code，浏览器授权与 token 轮询并行。
+
+    browser_approve(user_code, open_url, stop_event=None) -> bool
+    轮询拿到 access_token 时置位 stop_event。页面没到 done 不算成功。
+    点允许后若页面要求重新输入授权码，重新申请 user_code，最多 3 次。
+    3 次都失败时抛出 DeviceBrowserCodesExhausted，由外层改走协议授权。
+    """
+    sso_cookie = str(sso_cookie or "").strip()
+    if not sso_cookie:
+        log("  ❌ sso 为空")
+        return None
+    if not callable(browser_approve):
+        log("  ❌ browser_approve 回调不可用")
+        return None
+
+    if not _probe_sso_session(sso_cookie, proxy=proxy, log=log, cancel_callback=cancel_callback):
+        return None
+
+    # device_code 申请不强制绑 SSO，对齐 CPA 服务端角色
+    for attempt in range(1, DEVICE_BROWSER_CODE_ATTEMPTS + 1):
+        _check_token_cancelled(cancel_callback)
+        if attempt > 1:
+            log(
+                "  [*] 重新生成授权码后再授权 "
+                f"({attempt}/{DEVICE_BROWSER_CODE_ATTEMPTS}) ..."
+            )
+        device = request_device_code(proxy=proxy, log=log, session=None, cancel_callback=cancel_callback)
+        if not device:
+            return None
+        open_url = str(device.get("open_url") or "").strip()
+        if open_url and not _is_trusted_xai_url(open_url):
+            log(f"  ❌ verification URL 不受信: {open_url[:120]}")
+            return None
+        log(f"  [*] 浏览器授权: {open_url[:120]}")
+        try:
+            return _approve_one_device_code(
+                device,
+                browser_approve,
+                proxy=proxy,
+                log=log,
+                cancel_callback=cancel_callback,
+            )
+        except DeviceUserCodeRejected:
+            log(
+                "  ⚠️ 点击允许后页面要求重新输入授权码 "
+                f"user_code={device.get('user_code')}"
+            )
+            if attempt >= DEVICE_BROWSER_CODE_ATTEMPTS:
+                raise DeviceBrowserCodesExhausted(
+                    "浏览器授权码已试 "
+                    f"{DEVICE_BROWSER_CODE_ATTEMPTS} 次，页面仍提示 Enter the code again"
+                )
     return None
 
 
@@ -1425,10 +1485,12 @@ def sso_to_token(
     """SSO cookie → token dict。
 
     默认顺序：
-      1) 浏览器 Device（有 browser_approve 时）
-      2) 纯协议 Device verify/approve
+      1) 浏览器 Device（有 browser_approve 时）。
+         点允许后若要求重新输入授权码，重新申请 user_code，最多 3 次。
+      2) 上述 3 次仍失败时改走协议 Device verify/approve。
+         其他浏览器失败仍跳过协议，直接走 Authorization Code。
       3) Authorization Code（allow_fallback）
-    每一条失败后都会原样再试一次，仍失败才进入下一条。
+    除「授权码被页面拒绝」外，每一条失败后都会原样再试一次，仍失败才进入下一条。
     prefer: "device" | "auth_code"
     """
     sso_cookie = str(sso_cookie or "").strip()
@@ -1471,14 +1533,23 @@ def sso_to_token(
         return sso_to_token_auth_code(sso_cookie, **exchange_options)
 
     last_label = ""
-    for method in order:
+    index = 0
+    while index < len(order):
+        method = order[index]
+        index += 1
         _check_token_cancelled(cancel_callback)
         last_label = _TOKEN_METHOD_LABELS.get(method, method)
         for attempt in range(1, _TOKEN_METHOD_ATTEMPTS + 1):
             _check_token_cancelled(cancel_callback)
             if attempt > 1:
                 log(f"  [*] {last_label} 失败，重试一次 ...")
-            token = _exchange_once(method)
+            try:
+                token = _exchange_once(method)
+            except DeviceBrowserCodesExhausted as exc:
+                log(f"  ⚠️ {exc}，改为协议授权")
+                if "device_protocol" not in order:
+                    order.insert(index, "device_protocol")
+                break
             _check_token_cancelled(cancel_callback)
             if token and token.get("access_token"):
                 if attempt > 1:
@@ -1486,7 +1557,7 @@ def sso_to_token(
                 elif method != order[0]:
                     log(f"  ✅ 回退路径 {last_label} 成功")
                 return token
-        if method != order[-1]:
+        if index < len(order):
             log(f"  ⚠️ {last_label} 失败，回退下一路径 ...")
     log(f"  ❌ 全部换 token 路径失败（最后尝试 {last_label}）")
     return None

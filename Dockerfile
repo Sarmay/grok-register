@@ -24,11 +24,13 @@ RUN python3 -m venv /opt/venv \
     && pip install --upgrade pip \
     && pip install -r requirements.txt
 
-# 浏览器引擎直接内置到镜像，容器首次启动时不再临时下载。
+# 固定 Camoufox 0.5.6 + Playwright 1.60 能用的最低稳定浏览器。
+# Playwright 1.61 起要求浏览器 >= beta.30，更旧的安装会在启动时被判为不支持。
+# 1.60 在 152.0.4-beta.29 上可用，且该版本是 official/stable，构建时不会弹出确认。
 RUN python -m playwright install-deps || true \
-    && python -m camoufox fetch \
-    && python -m camoufox version \
-    && python -c "from camoufox.pkgman import installed_verstr, launch_path; print(f'Camoufox installed: {installed_verstr()} ({launch_path()})')"
+    && python -m camoufox fetch official/152.0.4-beta.29 \
+    && python -m camoufox set official/stable/152.0.4-beta.29 \
+    && python -c "from camoufox.pkgman import installed_verstr, launch_path; ver = installed_verstr(); expected = '152.0.4-beta.29'; assert ver == expected, f'expected {expected}, got {ver}'; print(f'Camoufox installed: {ver} ({launch_path()})')"
 
 FROM ubuntu:24.04 AS runtime
 ARG DEBIAN_FRONTEND=noninteractive

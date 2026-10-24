@@ -27,6 +27,7 @@ from backend.automation.session import (
     start_browser,
     stop_browser,
 )
+from backend.integrations.auth_exchange import DeviceUserCodeRejected
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 SIGNUP_NAVIGATION_ATTEMPTS = 3
@@ -2853,6 +2854,21 @@ def _norm_device_button(text: str) -> str:
     return " ".join(collapsed)
 
 
+def _device_button_matches(text: str, labels: frozenset) -> bool:
+    """整段命中，或每个词都是同一动作的别名。
+
+    中文同意按钮会把可见文字和 value 拼成「允许 allow」。
+    「Allow all」里有不属于允许动作的词，不能当成允许。
+    """
+    normalized = _norm_device_button(text)
+    if not normalized:
+        return False
+    if normalized in labels:
+        return True
+    tokens = normalized.split(" ")
+    return len(tokens) > 1 and all(token in labels for token in tokens)
+
+
 def device_cookie_banner_visible(body: str) -> bool:
     """识别 Cookie 同意层。页脚的 Cookie Policy 不算。"""
     source = str(body or "")
@@ -2868,16 +2884,19 @@ def next_device_approval_action(url: str, body: str, buttons, *, ignore_cookie: 
     lowered = source.lower()
     if "/oauth2/device/done" in lowered_url or "device authorized" in lowered or "you have authorized" in lowered or "设备已授权" in source:
         return "done"
-    if "invalid action" in lowered or "/oauth2/device/approve" in lowered_url:
+    if (
+        "invalid action" in lowered
+        or "enter the code again" in lowered
+        or "/oauth2/device/approve" in lowered_url
+    ):
         return "reload"
     if not ignore_cookie and device_cookie_banner_visible(source):
         return "dismiss-cookie"
     if "sign-in" in lowered_url or "sign-up" in lowered_url:
         return "need-login"
-    labels = {_norm_device_button(item) for item in buttons or []}
-    if labels & _DEVICE_ALLOW_EXACT:
+    if any(_device_button_matches(item, _DEVICE_ALLOW_EXACT) for item in buttons or []):
         return "click-allow"
-    if labels & _DEVICE_CONTINUE_EXACT:
+    if any(_device_button_matches(item, _DEVICE_CONTINUE_EXACT) for item in buttons or []):
         return "click-continue"
     return "wait"
 
@@ -2911,7 +2930,7 @@ def _click_device_button_exact(page_obj, labels: frozenset) -> str:
                     ).strip()
             except Exception:
                 continue
-            if _norm_device_button(text) not in labels:
+            if not _device_button_matches(text, labels):
                 continue
             try:
                 ele.click()
@@ -3026,7 +3045,7 @@ def authorize_device_in_browser(
     """在注册浏览器里完成 Device 页「继续」和 consent「允许」。
 
     真实点击后若仍停在 consent，改为写入 action=allow 再提交。
-    页面出现 Invalid action 时重新打开同一个 verification URL。
+    页面出现 Invalid action 或 Enter the code again 时，放弃当前授权码。
     只有到达 done 页，或外部轮询已经拿到 token，才返回 True。
     """
     user_code = str(user_code or "").strip()
@@ -3112,15 +3131,13 @@ def authorize_device_in_browser(
                 log_callback("[*] 浏览器 Device 授权完成（done）")
             return True
         if action == "reload":
+            if stop_event is not None and stop_event.is_set():
+                if log_callback:
+                    log_callback("[*] token 轮询已结束，退出 Device 授权页")
+                return True
             if log_callback:
-                log_callback("[!] Device 页返回 Invalid action，重新打开授权页")
-            allow_phase = 0
-            allow_at = 0.0
-            if not _open_device_page(work_page, open_url, log_callback, cancel_callback, stop_event):
-                if stop_event is not None and stop_event.is_set():
-                    return True
-                return False
-            continue
+                log_callback("[!] Device 页要求重新输入授权码（Enter the code again），放弃当前授权码")
+            raise DeviceUserCodeRejected("Device 页要求重新输入授权码")
         if action == "need-login":
             if log_callback:
                 log_callback("[!] Device 页要求重新登录，SSO 可能无效")

@@ -8,17 +8,19 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import ipaddress
 import json
 import os
 import signal
 import shutil
+import socket
 import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Callable, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import asyncio
 from greenlet import greenlet
@@ -90,16 +92,21 @@ class IsolatedCamoufox(_Camoufox):
 
 BROWSER_ENGINE_CAMOUFOX = "camoufox"
 BROWSER_ENGINE_CLOAKBROWSER = "cloakbrowser"
+BROWSER_ENGINE_ANTBROWSER = "antbrowser"
 SUPPORTED_BROWSER_ENGINES = {
     BROWSER_ENGINE_CAMOUFOX,
     BROWSER_ENGINE_CLOAKBROWSER,
+    BROWSER_ENGINE_ANTBROWSER,
 }
 
 # 仅允许删除这些目录树下的临时 profile，防止误删其它路径。
+# Ant Browser 的用户数据由本机应用管理，这里不登记可删除目录。
 _PROFILE_ROOT_MARKERS = {
     BROWSER_ENGINE_CAMOUFOX: "grok-register-camoufox",
     BROWSER_ENGINE_CLOAKBROWSER: "grok-register-cloakbrowser",
 }
+_ANTBROWSER_DEFAULT_BASE_URL = "http://127.0.0.1:19876"
+_ANTBROWSER_SESSION_TIMEOUT_MS = 45_000
 # 保留旧常量，兼容已有测试和外部导入。
 _PROFILE_ROOT_MARKER = _PROFILE_ROOT_MARKERS[BROWSER_ENGINE_CAMOUFOX]
 _CLOAK_PROFILE_ROOT_MARKER = _PROFILE_ROOT_MARKERS[BROWSER_ENGINE_CLOAKBROWSER]
@@ -112,7 +119,10 @@ _get_locale: Optional[Callable[[], str]] = None
 _get_engine: Optional[Callable[[], str]] = None
 _is_low_traffic: Optional[Callable[[], bool]] = None
 _get_traffic_savings_level: Optional[Callable[[], str]] = None
+_get_antbrowser_source: Optional[Callable[[], str]] = None
 _extension_path: str = ""
+_antbrowser_sessions_lock = threading.Lock()
+_antbrowser_sessions: dict[str, dict] = {}
 _start_fail_lock = threading.Lock()
 _start_fail_streak = 0
 _start_fail_threshold = 3
@@ -186,10 +196,12 @@ def configure(
     get_engine=None,
     is_low_traffic=None,
     get_traffic_savings_level=None,
+    get_antbrowser_source_code=None,
     extension_path="",
 ):
     global _get_proxy, _is_debug, _is_headless, _get_locale, _get_engine
-    global _is_low_traffic, _get_traffic_savings_level, _extension_path
+    global _is_low_traffic, _get_traffic_savings_level, _get_antbrowser_source
+    global _extension_path
     _get_proxy = get_proxies
     _is_debug = is_debug
     _is_headless = is_headless
@@ -197,6 +209,7 @@ def configure(
     _get_engine = get_engine
     _is_low_traffic = is_low_traffic
     _get_traffic_savings_level = get_traffic_savings_level
+    _get_antbrowser_source = get_antbrowser_source_code
     _extension_path = extension_path or ""
 
 
@@ -826,7 +839,10 @@ def _is_managed_profile_dir(path: str) -> bool:
 
 
 def _profile_root(engine: str) -> str:
-    marker = _PROFILE_ROOT_MARKERS[normalize_browser_engine(engine)]
+    selected = normalize_browser_engine(engine)
+    marker = _PROFILE_ROOT_MARKERS.get(selected)
+    if not marker:
+        return ""
     return os.path.join(tempfile.gettempdir(), marker)
 
 
@@ -892,7 +908,7 @@ def cleanup_stale_profiles(log_callback=None) -> int:
     cleaned = 0
     for engine in SUPPORTED_BROWSER_ENGINES:
         root = _profile_root(engine)
-        if not os.path.isdir(root):
+        if not root or not os.path.isdir(root):
             continue
         try:
             for entry in os.listdir(root):
@@ -986,7 +1002,7 @@ def _cleanup_all_managed_profiles(engine: Optional[str] = None) -> int:
     cleaned = 0
     for selected in engines:
         root = _profile_root(selected)
-        if not os.path.isdir(root):
+        if not root or not os.path.isdir(root):
             continue
         for entry in list(os.listdir(root)):
             path = os.path.join(root, entry)
@@ -1079,6 +1095,7 @@ def kill_all_cloakbrowser_processes(log_callback=None) -> dict:
 def kill_all_browser_processes(log_callback=None) -> dict:
     """Terminate both supported browser backends and remove managed profiles."""
     block_browser_launches()
+    stopped_ant = stop_tracked_antbrowser_sessions(log_callback=log_callback)
     result = _kill_browser_processes(
         _is_managed_browser_process,
         profile_engine=None,
@@ -1088,6 +1105,7 @@ def kill_all_browser_processes(log_callback=None) -> dict:
     result["killed"] = int(result.get("killed") or 0) + _kill_local_playwright_drivers(
         log_callback=log_callback
     )
+    result["antbrowser_stopped"] = stopped_ant
     return result
 
 
@@ -1323,11 +1341,199 @@ def create_cloakbrowser_options(unique_profile=True) -> dict:
     return opts
 
 
+def _antbrowser_base_url() -> str:
+    configured = str(os.environ.get("ANTBROWSER_BASE_URL", "") or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    # 容器里的 127.0.0.1 不是宿主机。Compose 已提供宿主机地址。
+    docker_host = str(os.environ.get("GROK_DOCKER_PROXY_HOST", "") or "").strip()
+    if docker_host:
+        return f"http://{docker_host}:19876"
+    return _ANTBROWSER_DEFAULT_BASE_URL
+
+
+def _antbrowser_endpoint(base_url: str) -> str:
+    """Chrome 的 CDP 只接受 IP 或 localhost 作为 Host。
+
+    Docker 里的 host.docker.internal 会被拒绝，所以先解析成 IPv4 再连接。
+    """
+    parsed = urlparse(str(base_url or "").strip())
+    host = parsed.hostname or ""
+    if not host or host in {"localhost", "127.0.0.1", "::1"}:
+        return str(base_url or "").rstrip("/")
+    try:
+        ipaddress.ip_address(host)
+        return str(base_url or "").rstrip("/")
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or 19876, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return str(base_url or "").rstrip("/")
+    ip = str(infos[0][4][0])
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme or 'http'}://{ip}{port}"
+
+
+def antbrowser_cdp_websocket(base_url: str, web_socket_debugger_url: str) -> str:
+    """保留浏览器返回的 /devtools 路径，把主机改成实际可达的 LaunchServer。"""
+    gateway = urlparse(str(base_url or ""))
+    endpoint = urlparse(str(web_socket_debugger_url or ""))
+    if not gateway.netloc or not endpoint.path.startswith("/devtools/"):
+        raise BrowserBackendUnavailable("Ant Browser 没有返回可用的 CDP 地址")
+    scheme = "wss" if gateway.scheme == "https" else "ws"
+    return urlunparse((scheme, gateway.netloc, endpoint.path, "", endpoint.query, ""))
+
+
+def _antbrowser_api_key() -> str:
+    return str(os.environ.get("ANTBROWSER_API_KEY", "") or "").strip()
+
+
+def _antbrowser_source_code() -> str:
+    value = ""
+    if _get_antbrowser_source:
+        value = str(_get_antbrowser_source() or "").strip()
+    if not value:
+        value = str(os.environ.get("ANTBROWSER_SOURCE_CODE", "") or "").strip()
+    value = value.upper()
+    return value or "HXI2F1"
+
+
+def _track_antbrowser_session(profile_id: str, base_url: str, api_key: str) -> None:
+    profile_id = str(profile_id or "").strip()
+    if not profile_id:
+        return
+    with _antbrowser_sessions_lock:
+        _antbrowser_sessions[profile_id] = {
+            "base_url": str(base_url or "").rstrip("/"),
+            "api_key": str(api_key or ""),
+            "thread_id": threading.get_ident(),
+        }
+
+
+def _untrack_antbrowser_session(profile_id: str) -> None:
+    with _antbrowser_sessions_lock:
+        _antbrowser_sessions.pop(str(profile_id or "").strip(), None)
+
+
+def _dispose_antbrowser_profile(profile_id: str, base_url: str, api_key: str) -> None:
+    """先停止，再删除复制出来的实例。源实例不会进入这个跟踪表。"""
+    profile_id = str(profile_id or "").strip()
+    if not profile_id:
+        return
+    try:
+        _antbrowser_request(
+            "POST",
+            f"/api/profiles/{profile_id}/stop",
+            {},
+            base_url=base_url,
+            api_key=api_key,
+        )
+    except Exception:
+        pass
+    status, body = _antbrowser_request(
+        "DELETE",
+        f"/api/profiles/{profile_id}",
+        base_url=base_url,
+        api_key=api_key,
+    )
+    if status not in {200, 202, 204, 404}:
+        raise BrowserBackendUnavailable(
+            f"删除 Ant Browser 实例失败: {body.get('error') or status}"
+        )
+
+
+def stop_tracked_antbrowser_sessions(log_callback=None, *, current_thread_only: bool = False) -> int:
+    """停止并删除已复制的 Ant Browser 实例。
+
+    这些进程不在容器内。current_thread_only 用于单个注册号收尾，
+    避免并发任务删掉其他线程正在使用的实例。
+    """
+    current_ident = threading.get_ident()
+    with _antbrowser_sessions_lock:
+        if current_thread_only:
+            sessions = [
+                (profile_id, info)
+                for profile_id, info in _antbrowser_sessions.items()
+                if info.get("thread_id") == current_ident
+            ]
+            for profile_id, _info in sessions:
+                _antbrowser_sessions.pop(profile_id, None)
+        else:
+            sessions = list(_antbrowser_sessions.items())
+            _antbrowser_sessions.clear()
+    stopped = 0
+    for profile_id, info in sessions:
+        try:
+            _dispose_antbrowser_profile(
+                profile_id,
+                str(info.get("base_url") or ""),
+                str(info.get("api_key") or ""),
+            )
+            stopped += 1
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[!] 停止并删除 Ant Browser 实例 {profile_id} 失败: {exc}")
+    if stopped and log_callback:
+        log_callback(f"[*] 已停止并删除 {stopped} 个 Ant Browser 实例")
+    return stopped
+
+
+def _delete_stale_antbrowser_copies(base_url: str, api_key: str, source_profile_id: str) -> int:
+    """开新号前清掉上次残留的 grok- 复制实例，不碰源实例。"""
+    status, profiles = _antbrowser_request(
+        "GET", "/api/profiles", base_url=base_url, api_key=api_key
+    )
+    if status >= 400:
+        return 0
+    items = profiles.get("items") if isinstance(profiles.get("items"), list) else []
+    with _antbrowser_sessions_lock:
+        protected = set(_antbrowser_sessions)
+    removed = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        profile_id = str(item.get("profileId") or "").strip()
+        name = str(item.get("profileName") or "")
+        if (
+            not profile_id
+            or profile_id == source_profile_id
+            or profile_id in protected
+            or not name.startswith("grok-")
+        ):
+            continue
+        try:
+            _dispose_antbrowser_profile(profile_id, base_url, api_key)
+            removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def create_antbrowser_options(unique_profile=True) -> dict:
+    """构建连接本机 Ant Browser 的参数。
+
+    指纹和代理沿用源实例。每个注册号都复制一个新实例，用完后停止并删除。
+    """
+    return {
+        "base_url": _antbrowser_base_url(),
+        "api_key": _antbrowser_api_key(),
+        "source_code": _antbrowser_source_code(),
+        "headless": _headless(),
+        "locale": _browser_locale(),
+        "inherit_proxy": True,
+        "unique_profile": bool(unique_profile),
+        "timeout_ms": _ANTBROWSER_SESSION_TIMEOUT_MS,
+    }
+
+
 def create_browser_options(unique_profile=True, engine: Optional[str] = None) -> dict:
     """按所选后端构建启动参数；默认继续使用 Camoufox。"""
     selected = normalize_browser_engine(engine or selected_browser_engine())
     if selected == BROWSER_ENGINE_CLOAKBROWSER:
         return create_cloakbrowser_options(unique_profile=unique_profile)
+    if selected == BROWSER_ENGINE_ANTBROWSER:
+        return create_antbrowser_options(unique_profile=unique_profile)
     return create_camoufox_options(unique_profile=unique_profile)
 
 
@@ -1340,6 +1546,166 @@ def _launch_camoufox_context(opts: dict):
     # PlaywrightContextManager 的 get_running_loop() 检查。
     camoufox = IsolatedCamoufox(**opts)
     return camoufox.__enter__(), camoufox
+
+
+def _antbrowser_request(method: str, path: str, payload: Optional[dict] = None, *, base_url: str = "", api_key: str = "") -> tuple[int, dict]:
+    import urllib.error
+    import urllib.request
+
+    url = f"{(base_url or _antbrowser_base_url()).rstrip('/')}{path}"
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    key = api_key if api_key is not None else _antbrowser_api_key()
+    if str(key or "").strip():
+        headers["X-Ant-Api-Key"] = str(key).strip()
+    request = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(request, timeout=max(_ANTBROWSER_SESSION_TIMEOUT_MS / 1000 + 5, 10)) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            status = int(response.status)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        status = int(exc.code)
+    except urllib.error.URLError as exc:
+        raise BrowserBackendUnavailable(
+            f"Ant Browser 未响应（{_antbrowser_base_url()}）：{exc.reason}"
+        ) from exc
+    try:
+        body = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise BrowserBackendUnavailable(f"Ant Browser 返回了无法解析的响应: {raw[:180]}") from exc
+    if not isinstance(body, dict):
+        body = {"value": body}
+    return status, body
+
+
+def _launch_antbrowser_context(opts: dict):
+    """复制一个新指纹实例，等待 CDP 就绪后用 Playwright 接管。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise BrowserBackendUnavailable("Ant Browser 后端需要 Playwright，请重新安装 requirements.txt") from exc
+
+    base_url = _antbrowser_endpoint(str(opts.get("base_url") or _antbrowser_base_url()))
+    api_key = str(opts.get("api_key") or "")
+    source_code = str(opts.get("source_code") or "").strip()
+    status, profiles = _antbrowser_request("GET", "/api/profiles", base_url=base_url, api_key=api_key)
+    if status >= 400 or not profiles.get("ok", status < 400):
+        raise BrowserBackendUnavailable(
+            f"读取 Ant Browser 实例失败: {profiles.get('error') or status}"
+        )
+    items = profiles.get("items") if isinstance(profiles.get("items"), list) else []
+    source = None
+    if source_code:
+        source = next(
+            (item for item in items if str(item.get("launchCode") or "").upper() == source_code.upper()),
+            None,
+        )
+        if source is None:
+            raise BrowserBackendUnavailable(f"Ant Browser 没有启动码为 {source_code} 的源实例")
+    elif items:
+        source = items[0]
+    if not isinstance(source, dict) or not str(source.get("profileId") or "").strip():
+        raise BrowserBackendUnavailable("Ant Browser 还没有可复制的实例，请先在应用里创建一个源实例")
+    stop_tracked_antbrowser_sessions(current_thread_only=True)
+    _delete_stale_antbrowser_copies(base_url, api_key, str(source.get("profileId") or ""))
+
+    profile_name = f"grok-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}"
+    copy_body: dict = {
+        "profileName": profile_name,
+        "mode": "auto_fingerprint",
+        "automationTargets": ["seed"],
+        "autoLaunch": False,
+    }
+    status, copied = _antbrowser_request(
+        "POST",
+        f"/api/profiles/{source['profileId']}/copy",
+        copy_body,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    if status >= 400 or not copied.get("ok", False):
+        raise BrowserBackendUnavailable(
+            f"复制 Ant Browser 实例失败: {copied.get('error') or status}"
+        )
+    launch_code = str(copied.get("launchCode") or "").strip()
+    profile_id = str(copied.get("profileId") or "").strip()
+    if not launch_code or not profile_id:
+        raise BrowserBackendUnavailable("Ant Browser 复制成功但没有返回 launchCode")
+    _track_antbrowser_session(profile_id, base_url, api_key)
+
+    status, session = _antbrowser_request(
+        "POST",
+        "/api/runtime/session",
+        {
+            "selector": {"code": launch_code, "matchMode": "unique"},
+            "timeoutMs": int(opts.get("timeout_ms") or _ANTBROWSER_SESSION_TIMEOUT_MS),
+            "skipDefaultStartUrls": True,
+        },
+        base_url=base_url,
+        api_key=api_key,
+    )
+    if status != 200 or not session.get("debugReady") or not str(session.get("cdpUrl") or "").strip():
+        _antbrowser_request(
+            "POST",
+            f"/api/profiles/{profile_id}/stop",
+            {},
+            base_url=base_url,
+            api_key=api_key,
+        )
+        _untrack_antbrowser_session(profile_id)
+        raise BrowserBackendUnavailable(
+            f"Ant Browser 实例未就绪: {session.get('error') or session.get('lastError') or status}"
+        )
+
+    version_status, version = _antbrowser_request(
+        "GET", "/json/version", base_url=base_url, api_key=api_key
+    )
+    try:
+        cdp_websocket = antbrowser_cdp_websocket(
+            base_url, str(version.get("webSocketDebuggerUrl") or "")
+        )
+    except BrowserBackendUnavailable:
+        cdp_websocket = ""
+    if version_status != 200 or not cdp_websocket:
+        _antbrowser_request(
+            "POST",
+            f"/api/profiles/{profile_id}/stop",
+            {},
+            base_url=base_url,
+            api_key=api_key,
+        )
+        _untrack_antbrowser_session(profile_id)
+        raise BrowserBackendUnavailable(
+            f"Ant Browser CDP 入口不可用: {version.get('error') or version_status}"
+        )
+
+    playwright = sync_playwright().start()
+    try:
+        browser = playwright.chromium.connect_over_cdp(cdp_websocket)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+    except Exception:
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+        _antbrowser_request(
+            "POST",
+            f"/api/profiles/{profile_id}/stop",
+            {},
+            base_url=base_url,
+            api_key=api_key,
+        )
+        _untrack_antbrowser_session(profile_id)
+        raise
+    _tls.profile_dir = None
+    _tls.browser_engine = BROWSER_ENGINE_ANTBROWSER
+    _tls.antbrowser_profile_id = profile_id
+    _tls.antbrowser_base_url = base_url
+    _tls.antbrowser_api_key = api_key
+    return context, (playwright, browser, profile_id, base_url, api_key)
 
 
 def _launch_cloakbrowser_context(opts: dict):
@@ -1371,14 +1737,30 @@ def _close_unwrapped_context(browser_context=None, lifecycle=None) -> None:
         pass
 
 
+def _engine_label(engine: str) -> str:
+    if engine == BROWSER_ENGINE_CLOAKBROWSER:
+        return "CloakBrowser"
+    if engine == BROWSER_ENGINE_ANTBROWSER:
+        return "Ant Browser"
+    return "Camoufox"
+
+
+def _launch_selected_context(engine: str, opts: dict):
+    if engine == BROWSER_ENGINE_CLOAKBROWSER:
+        return _launch_cloakbrowser_context(opts)
+    if engine == BROWSER_ENGINE_ANTBROWSER:
+        return _launch_antbrowser_context(opts)
+    return _launch_camoufox_context(opts)
+
+
 def start_browser(log_callback=None, cancel_callback=None) -> Tuple[object, object]:
     """启动当前配置的浏览器后端并返回共用页面适配对象。
 
-    ``browser_engine`` 缺省为 Camoufox；切换到 CloakBrowser 时只替换启动
-    与生命周期实现，上层注册步骤保持不变。
+    ``browser_engine`` 缺省为 Camoufox。CloakBrowser 与 Ant Browser 只替换
+    启动和生命周期，上层注册步骤保持不变。
     """
     engine = selected_browser_engine()
-    engine_label = "CloakBrowser" if engine == BROWSER_ENGINE_CLOAKBROWSER else "Camoufox"
+    engine_label = _engine_label(engine)
     last_exc = None
 
     def _launch_interrupted() -> bool:
@@ -1400,10 +1782,7 @@ def start_browser(log_callback=None, cancel_callback=None) -> Tuple[object, obje
             opts = create_browser_options(unique_profile=True, engine=engine)
             profile_dir = getattr(_tls, "profile_dir", None)
 
-            if engine == BROWSER_ENGINE_CLOAKBROWSER:
-                browser_context, lifecycle = _launch_cloakbrowser_context(opts)
-            else:
-                browser_context, lifecycle = _launch_camoufox_context(opts)
+            browser_context, lifecycle = _launch_selected_context(engine, opts)
 
             if _launch_interrupted():
                 raise RuntimeError("浏览器启动已被紧急终止操作阻止")
@@ -1445,11 +1824,16 @@ def start_browser(log_callback=None, cancel_callback=None) -> Tuple[object, obje
                 log_callback(f"[*] 浏览器后端: {engine_label}")
                 log_callback(f"[*] 浏览器模式: {'无头' if opts['headless'] else '有头'}")
                 log_callback(f"[*] 浏览器语言: {opts['locale']}")
-                proxy_options = opts.get("proxy") if isinstance(opts.get("proxy"), dict) else {}
-                proxy_server = str(proxy_options.get("server") or "").strip()
-                log_callback(
-                    f"[*] {engine_label} 网络: {'代理 ' + proxy_server if proxy_server else '直连（未配置代理）'}"
-                )
+                if engine == BROWSER_ENGINE_ANTBROWSER:
+                    log_callback(
+                        f"[*] Ant Browser 网络: 沿用源实例 {opts.get('source_code') or 'HXI2F1'} 的代理"
+                    )
+                else:
+                    proxy_options = opts.get("proxy") if isinstance(opts.get("proxy"), dict) else {}
+                    proxy_server = str(proxy_options.get("server") or "").strip()
+                    log_callback(
+                        f"[*] {engine_label} 网络: {'代理 ' + proxy_server if proxy_server else '直连（未配置代理）'}"
+                    )
             if log_callback and profile_dir:
                 log_callback(f"[Debug] 当前浏览器资料目录: {profile_dir}")
             if log_callback and attempt > 1:
@@ -1464,6 +1848,7 @@ def start_browser(log_callback=None, cancel_callback=None) -> Tuple[object, obje
                 )
             _close_unwrapped_context(browser_context, lifecycle)
             profile_dir = profile_dir or getattr(_tls, "profile_dir", None)
+            stop_tracked_antbrowser_sessions()
             try:
                 cur = active_browser()
                 if cur is not None:
@@ -1496,14 +1881,22 @@ def stop_browser(force=False):
         return
     current = active_browser()
     profile_dir = getattr(_tls, "profile_dir", None)
+    antbrowser_stopping = (
+        _browser_launch_blocked.is_set()
+        and getattr(current, "engine_name", "") == BROWSER_ENGINE_ANTBROWSER
+    )
+    if not antbrowser_stopping:
+        stop_tracked_antbrowser_sessions(current_thread_only=True)
     set_browser_session(None, None)
     if current is None:
         _cleanup_profile_dir(profile_dir)
         return
-    try:
-        current.quit(del_data=True)
-    except BaseException:
-        pass
+    # 停止任务时驱动会被杀掉。这时再 close Playwright 会卡死，任务一直停在“停止中”。
+    if not antbrowser_stopping:
+        try:
+            current.quit(del_data=True)
+        except BaseException:
+            pass
     _cleanup_profile_dir(profile_dir)
 
 

@@ -94,6 +94,7 @@ const OUTLOOK_PICK_MODES = [
 const BROWSER_ENGINES = [
   { value: "camoufox", label: "Camoufox（Firefox，默认）" },
   { value: "cloakbrowser", label: "CloakBrowser（Chromium）" },
+  { value: "antbrowser", label: "Ant Browser（本机指纹浏览器）" },
 ];
 const CLOUDFLARE_AUTH_MODES = [
   { value: "none", label: "无需鉴权" },
@@ -764,9 +765,18 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
                 {BROWSER_ENGINES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </Select>
               <p className="text-xs leading-5 text-muted-foreground">
-                Camoufox 始终保留；选择 CloakBrowser 后仅替换启动后端，注册流程保持一致。
+                Camoufox 始终保留。CloakBrowser 与 Ant Browser 只替换启动后端，注册流程保持一致。
               </p>
             </div>
+            {config.browser_engine === "antbrowser" ? (
+              <ConfigField
+                {...fieldState}
+                label="Ant Browser 源实例代码"
+                field="antbrowser_source_code"
+                placeholder="HXI2F1"
+                helper="每次注册从该实例复制新指纹。代理沿用源实例，不使用上面的网络代理。默认 HXI2F1。"
+              />
+            ) : null}
             <div className="min-w-0 space-y-2">
               <Label htmlFor="browser_locale">浏览器界面语言</Label>
               <Select

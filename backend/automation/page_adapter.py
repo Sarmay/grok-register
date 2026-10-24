@@ -621,9 +621,44 @@ class CamoufoxBrowser:
                 self._browser.close()
         except Exception:
             pass
-        # 再调用 Camoufox.__exit__ 释放 Playwright 事件循环
+        # Camoufox 用上下文管理器释放事件循环。
+        # Ant Browser 的 lifecycle 是 (playwright, browser, profile_id, base_url, api_key)。
         try:
-            if self._camoufox:
+            if isinstance(self._camoufox, tuple) and len(self._camoufox) == 5:
+                playwright, browser, profile_id, base_url, api_key = self._camoufox
+                try:
+                    if browser is not None:
+                        browser.close()
+                except Exception:
+                    pass
+                try:
+                    if playwright is not None:
+                        playwright.stop()
+                except Exception:
+                    pass
+                if profile_id and base_url:
+                    import urllib.error
+                    import urllib.request
+
+                    request = urllib.request.Request(
+                        f"{str(base_url).rstrip('/')}/api/profiles/{profile_id}/stop",
+                        data=b"{}",
+                        headers={
+                            "Accept": "application/json",
+                            "Content-Type": "application/json",
+                            **(
+                                {"X-Ant-Api-Key": str(api_key)}
+                                if str(api_key or "").strip()
+                                else {}
+                            ),
+                        },
+                        method="POST",
+                    )
+                    try:
+                        urllib.request.urlopen(request, timeout=10).close()
+                    except (urllib.error.URLError, TimeoutError, OSError):
+                        pass
+            elif self._camoufox:
                 self._camoufox.__exit__(None, None, None)
         except Exception:
             pass

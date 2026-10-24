@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -290,6 +291,91 @@ class BrowserHeadlessConfigTests(unittest.TestCase):
             browser, page = browser_session.start_browser()
 
         self.assertEqual(browser.engine_name, "cloakbrowser")
+        self.assertIs(page.raw_page, context.pages[0])
+        launch.assert_called_once()
+
+    def test_antbrowser_options_inherit_source_proxy_and_default_code(self):
+        browser_session.configure(
+            get_proxies=lambda: {"https": "http://user:pass@proxy.example.com:8080"},
+            is_headless=lambda: False,
+            get_locale=lambda: "zh-CN",
+            get_engine=lambda: "antbrowser",
+            get_antbrowser_source_code=lambda: "hxi2f1",
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"ANTBROWSER_BASE_URL": "", "GROK_DOCKER_PROXY_HOST": ""},
+            clear=False,
+        ):
+            options = browser_session.create_browser_options(unique_profile=True)
+
+        self.assertEqual(options["base_url"], "http://127.0.0.1:19876")
+        self.assertEqual(options["source_code"], "HXI2F1")
+        self.assertNotIn("proxy", options)
+        self.assertTrue(options["inherit_proxy"])
+        self.assertEqual(
+            browser_session.antbrowser_cdp_websocket(
+                options["base_url"],
+                "ws://127.0.0.1:9333/devtools/browser/abc",
+            ),
+            "ws://127.0.0.1:19876/devtools/browser/abc",
+        )
+
+    def test_antbrowser_uses_docker_host_when_running_in_container(self):
+        browser_session.configure(get_engine=lambda: "antbrowser")
+        with mock.patch.dict(
+            os.environ,
+            {"GROK_DOCKER_PROXY_HOST": "host.docker.internal"},
+            clear=False,
+        ):
+            options = browser_session.create_browser_options(unique_profile=False)
+        self.assertEqual(options["base_url"], "http://host.docker.internal:19876")
+        self.assertEqual(
+            browser_session.antbrowser_cdp_websocket(
+                options["base_url"],
+                "ws://127.0.0.1:9333/devtools/browser/abc",
+            ),
+            "ws://host.docker.internal:19876/devtools/browser/abc",
+        )
+
+    def test_antbrowser_endpoint_uses_ipv4_for_cdp_host_check(self):
+        with mock.patch(
+            "backend.automation.session.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.2", 19876))],
+        ):
+            self.assertEqual(
+                browser_session._antbrowser_endpoint("http://host.docker.internal:19876"),
+                "http://10.0.0.2:19876",
+            )
+        self.assertEqual(
+            browser_session._antbrowser_endpoint("http://127.0.0.1:19876"),
+            "http://127.0.0.1:19876",
+        )
+
+    def test_start_browser_dispatches_to_antbrowser_backend(self):
+        class FakePage:
+            pass
+
+        class FakeContext:
+            def __init__(self):
+                self.pages = [FakePage()]
+
+            def new_page(self):
+                page = FakePage()
+                self.pages.append(page)
+                return page
+
+        context = FakeContext()
+        browser_session.configure(get_engine=lambda: "antbrowser")
+        with mock.patch.object(
+            browser_session,
+            "_launch_antbrowser_context",
+            return_value=(context, None),
+        ) as launch:
+            browser, page = browser_session.start_browser()
+
+        self.assertEqual(browser.engine_name, "antbrowser")
         self.assertIs(page.raw_page, context.pages[0])
         launch.assert_called_once()
 
