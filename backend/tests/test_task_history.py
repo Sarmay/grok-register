@@ -228,19 +228,23 @@ class TaskRunRecorderTests(unittest.TestCase):
         missing.finish(2.0, "finished", {})
 
     def test_each_line_is_written_to_the_log_file_immediately(self):
-        repo = self._Repo()
-        recorder = TaskRunRecorder(KIND_REGISTRATION, "web-live", lambda: repo)
-        recorder.begin(100.0, {})
-        recorder.append(1, "第一行", "2026-09-23 09:00:00+08:00")
-        recorder.append(2, "第二行", "2026-09-23 09:00:01+08:00")
         path = log_file_path(KIND_REGISTRATION, "web-live")
-        # 第二行还在 SQLite 的缓冲里，文件里已经能读到
-        self.assertEqual(
-            path.read_text(encoding="utf-8").splitlines(),
-            ["[2026-09-23 09:00:00+08:00] 第一行", "[2026-09-23 09:00:01+08:00] 第二行"],
-        )
-        recorder.finish(160.0, "finished", {})
-        self.assertIsNone(recorder._log_file)
+        path.unlink(missing_ok=True)
+        try:
+            repo = self._Repo()
+            recorder = TaskRunRecorder(KIND_REGISTRATION, "web-live", lambda: repo)
+            recorder.begin(100.0, {})
+            recorder.append(1, "第一行", "2026-09-23 09:00:00+08:00")
+            recorder.append(2, "第二行", "2026-09-23 09:00:01+08:00")
+            # 第二行还在 SQLite 的缓冲里，文件里已经能读到
+            self.assertEqual(
+                path.read_text(encoding="utf-8").splitlines(),
+                ["[2026-09-23 09:00:00+08:00] 第一行", "[2026-09-23 09:00:01+08:00] 第二行"],
+            )
+            recorder.finish(160.0, "finished", {})
+            self.assertIsNone(recorder._log_file)
+        finally:
+            path.unlink(missing_ok=True)
 
     def test_log_file_name_is_sanitized(self):
         path = log_file_path(KIND_RELOGIN, "../evil/run id")

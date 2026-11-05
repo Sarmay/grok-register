@@ -8,6 +8,7 @@ from backend.integrations.proxy import (
     clear_sticky_proxy_account,
     current_sticky_proxy_account,
     parse_http_proxy_url,
+    proxy_url_for_host_browser,
     redact_proxy_text,
     redact_proxy_url,
     resolve_proxy_url,
@@ -133,6 +134,35 @@ class ResinStickyAccountTests(unittest.TestCase):
             bound,
             "http://1024proxy.rabc1234:p%40ss@proxy.example.com:2260",
         )
+
+    def test_host_browser_rewrites_docker_alias_to_loopback(self):
+        self.assertEqual(
+            proxy_url_for_host_browser(
+                "http://1024proxy.rabc1234:secret@host.docker.internal:2260"
+            ),
+            "http://1024proxy.rabc1234:secret@127.0.0.1:2260",
+        )
+        self.assertEqual(
+            proxy_url_for_host_browser(
+                "http://user%40mail:p%40ss@gateway.docker.internal:7897"
+            ),
+            "http://user%40mail:p%40ss@127.0.0.1:7897",
+        )
+
+    def test_host_browser_keeps_remote_and_loopback_proxies(self):
+        remote = "http://1024proxy:secret@proxy.example.com:2260"
+        local = "http://1024proxy:secret@127.0.0.1:2260"
+        self.assertEqual(proxy_url_for_host_browser(remote), remote)
+        self.assertEqual(proxy_url_for_host_browser(local), local)
+
+    def test_host_browser_rewrites_configured_docker_host_alias(self):
+        with mock.patch.dict(
+            "os.environ", {"GROK_DOCKER_PROXY_HOST": "docker-host.internal"}, clear=False
+        ):
+            self.assertEqual(
+                proxy_url_for_host_browser("socks5://user:pass@docker-host.internal:2260"),
+                "socks5://user:pass@127.0.0.1:2260",
+            )
 
     def test_active_proxy_uses_the_thread_account_after_host_rewrite(self):
         with mock.patch.dict(

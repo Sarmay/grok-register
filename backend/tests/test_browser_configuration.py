@@ -296,7 +296,7 @@ class BrowserHeadlessConfigTests(unittest.TestCase):
 
     def test_antbrowser_options_inherit_source_proxy_and_default_code(self):
         browser_session.configure(
-            get_proxies=lambda: {"https": "http://user:pass@proxy.example.com:8080"},
+            get_proxies=lambda: {},
             is_headless=lambda: False,
             get_locale=lambda: "zh-CN",
             get_engine=lambda: "antbrowser",
@@ -321,6 +321,153 @@ class BrowserHeadlessConfigTests(unittest.TestCase):
             ),
             "ws://127.0.0.1:19876/devtools/browser/abc",
         )
+
+    def test_antbrowser_options_use_configured_proxy(self):
+        browser_session.configure(
+            get_proxies=lambda: {"https": "http://user:pass@proxy.example.com:8080"},
+            is_headless=lambda: False,
+            get_locale=lambda: "zh-CN",
+            get_engine=lambda: "antbrowser",
+            get_antbrowser_source_code=lambda: "hxi2f1",
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"ANTBROWSER_BASE_URL": "", "GROK_DOCKER_PROXY_HOST": ""},
+            clear=False,
+        ):
+            options = browser_session.create_browser_options(unique_profile=True)
+
+        self.assertEqual(options["base_url"], "http://127.0.0.1:19876")
+        self.assertEqual(options["source_code"], "HXI2F1")
+        self.assertEqual(options["proxy"], "http://user:pass@proxy.example.com:8080")
+        self.assertFalse(options["inherit_proxy"])
+
+    def test_antbrowser_options_rewrite_docker_proxy_host_for_the_host_browser(self):
+        browser_session.configure(
+            get_proxies=lambda: {
+                "https": "http://1024proxy.rabc1234:secret@host.docker.internal:2260"
+            },
+            is_headless=lambda: False,
+            get_locale=lambda: "en-US",
+            get_engine=lambda: "antbrowser",
+        )
+
+        options = browser_session.create_browser_options(unique_profile=False)
+
+        self.assertEqual(
+            options["proxy"],
+            "http://1024proxy.rabc1234:secret@127.0.0.1:2260",
+        )
+
+    def test_launch_antbrowser_context_sends_proxy_config_to_copy_api(self):
+        calls = []
+
+        def fake_request(method, path, payload=None, base_url="", api_key=""):
+            calls.append((method, path, payload))
+            if path == "/api/profiles":
+                return 200, {"ok": True, "items": [{"launchCode": "HXI2F1", "profileId": "src-1"}]}
+            if path == "/api/profiles/src-1/copy":
+                return 200, {"ok": True, "launchCode": "NEW_01", "profileId": "copy-1"}
+            if path == "/api/runtime/session":
+                return 200, {"ok": True, "debugReady": True, "cdpUrl": "http://127.0.0.1:19876"}
+            if path == "/json/version":
+                return 200, {"webSocketDebuggerUrl": "ws://127.0.0.1:19876/devtools/browser/xyz"}
+            return 200, {"ok": True}
+
+        fake_playwright = mock.MagicMock()
+        fake_browser = mock.MagicMock()
+        fake_context = mock.MagicMock()
+        fake_browser.contexts = [fake_context]
+        fake_playwright.chromium.connect_over_cdp.return_value = fake_browser
+
+        with (
+            mock.patch.object(browser_session, "_antbrowser_request", side_effect=fake_request),
+            mock.patch("playwright.sync_api.sync_playwright", return_value=mock.MagicMock(start=lambda: fake_playwright)),
+        ):
+            opts = {
+                "base_url": "http://127.0.0.1:19876",
+                "api_key": "",
+                "source_code": "HXI2F1",
+                "proxy": "http://user:pass@proxy.example.com:8080",
+            }
+            context, lifecycle = browser_session._launch_antbrowser_context(opts)
+
+        copy_calls = [c for c in calls if c[0] == "POST" and c[1].endswith("/copy")]
+        self.assertEqual(len(copy_calls), 1)
+        self.assertEqual(copy_calls[0][2].get("proxyConfig"), "http://user:pass@proxy.example.com:8080")
+
+    def test_launch_antbrowser_context_binds_sticky_account_to_inherited_source_proxy(self):
+        calls = []
+
+        def fake_request(method, path, payload=None, base_url="", api_key=""):
+            calls.append((method, path, payload))
+            if path == "/api/profiles":
+                return 200, {
+                    "ok": True,
+                    "items": [
+                        {
+                            "launchCode": "HXI2F1",
+                            "profileId": "src-1",
+                            "proxyConfig": "http://1024proxy:akak0928@127.0.0.1:2260",
+                        }
+                    ],
+                }
+            if path == "/api/profiles/src-1/copy":
+                return 200, {"ok": True, "launchCode": "NEW_01", "profileId": "copy-1"}
+            if path == "/api/runtime/session":
+                return 200, {"ok": True, "debugReady": True, "cdpUrl": "http://127.0.0.1:19876"}
+            if path == "/json/version":
+                return 200, {"webSocketDebuggerUrl": "ws://127.0.0.1:19876/devtools/browser/xyz"}
+            return 200, {"ok": True}
+
+        fake_playwright = mock.MagicMock()
+        fake_browser = mock.MagicMock()
+        fake_context = mock.MagicMock()
+        fake_browser.contexts = [fake_context]
+        fake_playwright.chromium.connect_over_cdp.return_value = fake_browser
+
+        with (
+            mock.patch.object(browser_session, "_antbrowser_request", side_effect=fake_request),
+            mock.patch("playwright.sync_api.sync_playwright", return_value=mock.MagicMock(start=lambda: fake_playwright)),
+        ):
+            opts = {
+                "base_url": "http://127.0.0.1:19876",
+                "api_key": "",
+                "source_code": "HXI2F1",
+                "inherit_proxy": True,
+                "unique_profile": True,
+            }
+            context, lifecycle = browser_session._launch_antbrowser_context(opts)
+
+        copy_calls = [c for c in calls if c[0] == "POST" and c[1].endswith("/copy")]
+        self.assertEqual(len(copy_calls), 1)
+        copied_proxy = copy_calls[0][2].get("proxyConfig", "")
+        self.assertTrue(copied_proxy.startswith("http://1024proxy.r"))
+        self.assertTrue(copied_proxy.endswith(":akak0928@127.0.0.1:2260"))
+        account = browser_session.current_sticky_proxy_account()
+        self.assertTrue(bool(account))
+        self.assertIn(f"1024proxy.{account}", copied_proxy)
+
+    def test_stop_browser_clears_sticky_account_and_next_launch_allocates_fresh_account(self):
+        browser_session.configure(
+            get_proxies=lambda: {},
+            is_headless=lambda: False,
+            get_locale=lambda: "zh-CN",
+            get_engine=lambda: "antbrowser",
+            get_antbrowser_source_code=lambda: "hxi2f1",
+        )
+        opts1 = browser_session.create_browser_options(unique_profile=True)
+        acc1 = browser_session.current_sticky_proxy_account()
+        self.assertTrue(bool(acc1))
+
+        browser_session.stop_browser(force=True)
+        self.assertEqual(browser_session.current_sticky_proxy_account(), "")
+
+        opts2 = browser_session.create_browser_options(unique_profile=True)
+        acc2 = browser_session.current_sticky_proxy_account()
+        self.assertTrue(bool(acc2))
+        self.assertNotEqual(acc1, acc2)
 
     def test_antbrowser_uses_docker_host_when_running_in_container(self):
         browser_session.configure(get_engine=lambda: "antbrowser")

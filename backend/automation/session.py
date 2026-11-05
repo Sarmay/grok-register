@@ -35,7 +35,16 @@ from playwright._impl._transport import PipeTransport as _PwPipeTransport
 from playwright.sync_api._generated import Playwright as _SyncPlaywright
 
 from backend.automation.page_adapter import BrowserAdapter, PageAdapter
-from backend.integrations.proxy import HTTP_PROXY_SCHEMES, parse_http_proxy_url
+from backend.integrations.proxy import (
+    HTTP_PROXY_SCHEMES,
+    begin_sticky_proxy_account,
+    bind_resin_sticky_account,
+    clear_sticky_proxy_account,
+    current_sticky_proxy_account,
+    parse_http_proxy_url,
+    proxy_url_for_host_browser,
+    redact_proxy_url,
+)
 
 
 class IsolatedCamoufox(_Camoufox):
@@ -1513,22 +1522,35 @@ def _delete_stale_antbrowser_copies(base_url: str, api_key: str, source_profile_
 def create_antbrowser_options(unique_profile=True) -> dict:
     """构建连接本机 Ant Browser 的参数。
 
-    指纹和代理沿用源实例。每个注册号都复制一个新实例，用完后停止并删除。
+    未配置代理时沿用源实例的代理；配置代理时通过 proxyConfig 覆盖。
+    容器里的 Docker 主机别名会改回 127.0.0.1，因为浏览器进程在宿主机上。
+    每个注册号都复制一个新实例，用完后停止并删除。
     """
-    return {
+    if unique_profile and not current_sticky_proxy_account():
+        begin_sticky_proxy_account()
+    proxies = _proxies()
+    proxy = proxy_url_for_host_browser(
+        str(proxies.get("https") or proxies.get("http") or "").strip()
+    )
+    opts: dict = {
         "base_url": _antbrowser_base_url(),
         "api_key": _antbrowser_api_key(),
         "source_code": _antbrowser_source_code(),
         "headless": _headless(),
         "locale": _browser_locale(),
-        "inherit_proxy": True,
+        "inherit_proxy": not bool(proxy),
         "unique_profile": bool(unique_profile),
         "timeout_ms": _ANTBROWSER_SESSION_TIMEOUT_MS,
     }
+    if proxy:
+        opts["proxy"] = proxy
+    return opts
 
 
 def create_browser_options(unique_profile=True, engine: Optional[str] = None) -> dict:
     """按所选后端构建启动参数；默认继续使用 Camoufox。"""
+    if unique_profile and not current_sticky_proxy_account():
+        begin_sticky_proxy_account()
     selected = normalize_browser_engine(engine or selected_browser_engine())
     if selected == BROWSER_ENGINE_CLOAKBROWSER:
         return create_cloakbrowser_options(unique_profile=unique_profile)
@@ -1619,6 +1641,18 @@ def _launch_antbrowser_context(opts: dict):
         "automationTargets": ["seed"],
         "autoLaunch": False,
     }
+    proxy = str(opts.get("proxy") or "").strip()
+    if not proxy and opts.get("inherit_proxy", False):
+        source_proxy = str(source.get("proxyConfig") or "").strip()
+        if source_proxy:
+            proxy = proxy_url_for_host_browser(source_proxy)
+    account = current_sticky_proxy_account()
+    if not account and opts.get("unique_profile", False):
+        account = begin_sticky_proxy_account()
+    if proxy and account:
+        proxy = bind_resin_sticky_account(proxy, account)
+    if proxy:
+        copy_body["proxyConfig"] = proxy
     status, copied = _antbrowser_request(
         "POST",
         f"/api/profiles/{source['profileId']}/copy",
@@ -1825,9 +1859,15 @@ def start_browser(log_callback=None, cancel_callback=None) -> Tuple[object, obje
                 log_callback(f"[*] 浏览器模式: {'无头' if opts['headless'] else '有头'}")
                 log_callback(f"[*] 浏览器语言: {opts['locale']}")
                 if engine == BROWSER_ENGINE_ANTBROWSER:
-                    log_callback(
-                        f"[*] Ant Browser 网络: 沿用源实例 {opts.get('source_code') or 'HXI2F1'} 的代理"
-                    )
+                    custom_proxy = str(opts.get("proxy") or "").strip()
+                    if custom_proxy:
+                        log_callback(
+                            f"[*] Ant Browser 网络: 自定义代理 {redact_proxy_url(custom_proxy)}"
+                        )
+                    else:
+                        log_callback(
+                            f"[*] Ant Browser 网络: 沿用源实例 {opts.get('source_code') or 'HXI2F1'} 的代理"
+                        )
                 else:
                     proxy_options = opts.get("proxy") if isinstance(opts.get("proxy"), dict) else {}
                     proxy_server = str(proxy_options.get("server") or "").strip()
@@ -1857,6 +1897,7 @@ def start_browser(log_callback=None, cancel_callback=None) -> Tuple[object, obje
                 pass
             set_browser_session(None, None)
             _cleanup_profile_dir(profile_dir)
+            clear_sticky_proxy_account()
             if isinstance(exc, BrowserBackendUnavailable):
                 break
             if _launch_interrupted():
@@ -1888,6 +1929,7 @@ def stop_browser(force=False):
     if not antbrowser_stopping:
         stop_tracked_antbrowser_sessions(current_thread_only=True)
     set_browser_session(None, None)
+    clear_sticky_proxy_account()
     if current is None:
         _cleanup_profile_dir(profile_dir)
         return

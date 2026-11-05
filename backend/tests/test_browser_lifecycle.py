@@ -88,7 +88,7 @@ class CamoufoxProcessMatchTests(unittest.TestCase):
         ):
             result = browser_session.kill_all_browser_processes()
 
-        self.assertEqual(result, {"killed": 4, "profiles_cleaned": 3})
+        self.assertEqual(result, {"killed": 4, "profiles_cleaned": 3, "antbrowser_stopped": 0})
         self.assertEqual({pid for pid, _ in killed}, {101, 102, 301, 302})
         self.assertNotIn(401, {pid for pid, _ in killed})
 

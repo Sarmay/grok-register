@@ -15,6 +15,13 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 LOCAL_PROXY_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+# These names reach the host from inside Docker. A browser running on the host
+# must not dial them: on macOS they often resolve into a TUN fake-ip and the
+# proxy handshake is reset.
+HOST_BROWSER_PROXY_ALIASES = frozenset({
+    "host.docker.internal",
+    "gateway.docker.internal",
+})
 HTTP_PROXY_SCHEMES = frozenset({"http", "https"})
 
 _BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
@@ -177,11 +184,13 @@ def current_sticky_proxy_account() -> str:
     return str(getattr(_sticky_proxy, "account", "") or "")
 
 
-def begin_sticky_proxy_account() -> str:
+def begin_sticky_proxy_account(account: str = "") -> str:
     """为本线程开始一个新的 Resin 粘性账号。"""
-    account = "r" + secrets.token_hex(4)
-    _sticky_proxy.account = account
-    return account
+    normalized = _STICKY_ACCOUNT_RE.sub("", str(account or ""))[:48]
+    if not normalized:
+        normalized = "r" + secrets.token_hex(4)
+    _sticky_proxy.account = normalized
+    return normalized
 
 
 def clear_sticky_proxy_account() -> None:
@@ -218,3 +227,37 @@ def active_proxy_url(proxy_url: str) -> str:
         resolve_proxy_url(proxy_url),
         current_sticky_proxy_account(),
     )
+
+
+def proxy_url_for_host_browser(proxy_url: str) -> str:
+    """把只在容器里可达的代理主机改回宿主机回环地址。
+
+    grok-register 在 Docker 里用 host.docker.internal 访问宿主机上的 Resin。
+    Ant Browser 和它的本地代理桥跑在宿主机上。这个别名在宿主机上会被解析到
+    TUN 假 IP，HTTP 代理握手被对端直接断开，浏览器就上不了网。发布在宿主机
+    上的 Resin 端口要通过 127.0.0.1 访问。
+    """
+    value = str(proxy_url or "").strip()
+    if not value:
+        return value
+
+    aliases = {alias.lower() for alias in HOST_BROWSER_PROXY_ALIASES}
+    docker_host = str(os.environ.get("GROK_DOCKER_PROXY_HOST", "") or "").strip().lower()
+    if docker_host:
+        aliases.add(docker_host)
+
+    has_scheme = "://" in value
+    try:
+        parsed = urlsplit(value if has_scheme else f"http://{value}")
+        parsed.port
+    except ValueError:
+        return value
+    if (parsed.hostname or "").lower() not in aliases:
+        return value
+
+    auth = parsed.netloc.rsplit("@", 1)[0] + "@" if "@" in parsed.netloc else ""
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    resolved = urlunsplit(
+        (parsed.scheme, f"{auth}127.0.0.1{port}", parsed.path, parsed.query, parsed.fragment)
+    )
+    return resolved if has_scheme else resolved.split("://", 1)[1]

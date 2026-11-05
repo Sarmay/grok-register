@@ -96,6 +96,23 @@ class ProxyRoutingTests(unittest.TestCase):
             },
         )
 
+    def test_antbrowser_registration_keeps_configured_proxy(self):
+        browser_session.configure(
+            get_proxies=lambda: {
+                "https": "http://user%40mail:p%40ss%3Aword@proxy.example.com:7897"
+            },
+            is_debug=lambda: False,
+            is_headless=lambda: False,
+            get_locale=lambda: "en-US",
+            get_engine=lambda: "antbrowser",
+        )
+        options = browser_session.create_browser_options(unique_profile=False)
+        self.assertEqual(
+            options["proxy"],
+            "http://user%40mail:p%40ss%3Aword@proxy.example.com:7897",
+        )
+        self.assertFalse(options["inherit_proxy"])
+
     def test_http_client_sends_encoded_proxy_credentials_as_basic_auth(self):
         captured = {}
 

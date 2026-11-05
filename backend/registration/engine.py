@@ -472,12 +472,13 @@ class RegistrationRiskDenied(Exception):
 
 
 def _restart_browser_for_fresh_exit(log_callback=None, cancel_callback=None, *, reason=""):
-    """先换 Resin 粘性账号，再重启浏览器，从而拿到新的出口 IP。"""
+    """先关闭浏览器，再换 Resin 粘性账号启动新浏览器，从而拿到新的出口 IP。"""
+    stop_browser(force=True)
     account = begin_sticky_proxy_account()
     if log_callback:
         prefix = f"{reason}，" if reason else ""
         log_callback(f"[代理] {prefix}更换出口，Resin 粘性账号改为 {account}")
-    return restart_browser(log_callback=log_callback, cancel_callback=cancel_callback)
+    return start_browser(log_callback=log_callback, cancel_callback=cancel_callback)
 
 
 def prepare_registration_exit_ip(log_callback=None) -> str:
